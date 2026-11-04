@@ -1,0 +1,26 @@
+{
+  "customer": {
+    "firstName": "Demo",
+    "middleInitial": "",
+    "lastName": "Customer",
+    "zipCode": "00000",
+    "streetAddress": "Example Street",
+    "unitType": "Apartment",
+    "unitNumber": "1",
+    "city": "Sample City",
+    "state": "ST",
+    "residenceType": "Apartment",
+    "ownership": "Rent",
+    "leadId": "",
+    "moving": "No",
+    "moveInDate": ""
+  },
+  "customerType": "New",
+  "provider": "Xfinity",
+  "speedMbps": 300,
+  "videoBundle": false,
+  "phoneService": false,
+  "equipment": "provider-modem",
+  "creditScenario": "approved-mock-profile",
+  "installation": "self-install"
+}
