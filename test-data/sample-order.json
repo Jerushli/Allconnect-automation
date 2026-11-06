@@ -3,24 +3,53 @@
     "firstName": "Demo",
     "middleInitial": "",
     "lastName": "Customer",
-    "zipCode": "00000",
-    "streetAddress": "Example Street",
+    "zipCode": "12207",
+    "streetAddress": "123 ple Street",
     "unitType": "Apartment",
     "unitNumber": "1",
     "city": "Sample City",
-    "state": "ST",
+    "state": "NY",
     "residenceType": "Apartment",
     "ownership": "Rent",
     "leadId": "",
     "moving": "No",
-    "moveInDate": ""
+    "moveInDate": "",
+    "prefix": "Mr",
+    "phone": "6369345333",
+    "email": "josejero@gmail.com"
   },
   "customerType": "New",
-  "provider": "Xfinity",
+  "provider": "ProviderXX",
   "speedMbps": 300,
   "videoBundle": false,
   "phoneService": false,
   "equipment": "provider-modem",
   "creditScenario": "approved-mock-profile",
-  "installation": "self-install"
+  "plan": {
+    "term": "1-year",
+    "monthlyPrice": 40,
+    "installationPrice": 0
+  },
+  "accountHolder": {
+    "isAccountHolder": true,
+    "isExistingProviderCustomer": false,
+    "ezEnroll": false,
+    "automaticPayments": true,
+    "readAcknowledgement": true,
+    "mailingAddressSameAsService": true,
+    "shippingAddressSameAsService": true
+  },
+  "execution": {
+    "mode": "demo",
+    "stopBeforeFinalOrderSubmission": true
+  },
+  "checkout": {
+    "broadbandFactLabels": "not_requested",
+    "broadbandFactLabelsRead": true,
+    "equipment": "leased_gateway",
+    "nowTv": false
+  },
+  "installation": {
+    "type": "standard_shipping"
+  }
 }
