@@ -50,12 +50,6 @@ const dummyCustomer = {
   }
 },
 
-  identity: {
-    // Synthetic values for the demo portal only.
-    ssn: '000000000',
-    dateOfBirth: '01/01/1990'
-  },
-
   installation: {
     preference: 'standard',
     confirmInstallation: false

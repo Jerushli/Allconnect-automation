@@ -59,6 +59,18 @@ function mapOrderToAutomationInput(order) {
   const checkout = order.checkout;
   const installation = order.installation;
 
+  const speedMbps = Number.parseFloat(
+    String(order.speedMbps).match(/[\d.]+/)?.[0] || ''
+  );
+
+  if (!Number.isFinite(speedMbps) || speedMbps <= 0) {
+    throw new Error('speedMbps must be a positive number.');
+  }
+
+  if (typeof order.provider !== 'string' || !order.provider.trim()) {
+    throw new Error('provider must be a non-empty string.');
+  }
+
   return {
     customer: {
       prefix: customer.prefix || 'Mr',
@@ -84,7 +96,7 @@ function mapOrderToAutomationInput(order) {
 
     plan: {
       provider: order.provider,
-      speed: `${order.speedMbps} Mbps`,
+      speed: `${speedMbps} Mbps`,
       term: plan.term,
       monthlyPrice: plan.monthlyPrice,
       installationPrice: plan.installationPrice

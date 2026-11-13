@@ -10,6 +10,7 @@ const {
 } = require('./main');
 
 const { mapOrderToAutomationInput } = require('./orderMapper');
+const { classifyError } = require('./recovery');
 
 const PORT = Number(process.env.API_PORT || 3000);
 
@@ -100,7 +101,7 @@ function createApp(options = {}) {
       } catch (error) {
         return res.status(400).json({
           status: 'invalid_order',
-          message: error.message
+          message: 'Order validation failed.'
         });
       }
 
@@ -133,10 +134,7 @@ function createApp(options = {}) {
         });
 
       } catch (error) {
-        console.error(
-          `[API] Automation failed. Run ID: ${runId}`,
-          error.message
-        );
+        console.error(`[API] Automation failed. Run ID: ${runId} Type: ${classifyError(error).type}`);
 
         return res.status(500).json({
           runId,
@@ -173,7 +171,7 @@ function createApp(options = {}) {
       });
     }
 
-    console.error('[API] Request error:', error.message);
+    console.error('[API] Request error:', classifyError(error).type);
 
     return res.status(500).json({
       status: 'error',

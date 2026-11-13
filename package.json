@@ -6,7 +6,8 @@
     "start": "node src/main.js",
     "test": "playwright test",
     "inspect": "playwright codegen",
-    "api": "node src/server.js"
+    "api": "node src/server.js",
+    "scenario": "node src/scenarioRunner.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.0",

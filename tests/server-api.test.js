@@ -12,6 +12,8 @@ let baseUrl;
 let holdAutomation = false;
 let releaseAutomation;
 let automationStarted;
+let stoppedSafely = false;
+let failAutomation = false;
 
 const mockReport = {
   status: 'completed',
@@ -31,6 +33,7 @@ const mockReport = {
 };
 
 async function mockRunAutomation(input) {
+  if (failAutomation) throw new Error('controlled runner failure');
   if (holdAutomation) {
     automationStarted = new Promise(resolve => {
       resolveAutomationStarted = resolve;
@@ -43,7 +46,9 @@ async function mockRunAutomation(input) {
     });
   }
 
-  return mockReport;
+  return stoppedSafely
+    ? { ...mockReport, status: 'stopped_safely', safetyCheckpoint: { ...mockReport.safetyCheckpoint } }
+    : mockReport;
 }
 
 let resolveAutomationStarted;
@@ -136,7 +141,42 @@ test.describe('AllConnect API tests', () => {
     const body = await response.json();
 
     expect(body.status).toBe('invalid_order');
-    expect(body.message).toContain('firstName');
+    expect(body.message).toBe('Order validation failed.');
+  });
+
+  test('rejects orders missing different required customer fields', async () => {
+    for (const field of ['lastName', 'city', 'zipCode', 'email']) {
+      const order = createOrder();
+      delete order.customer[field];
+      const response = await orderRequest(order);
+      expect(response.status, `missing ${field}`).toBe(400);
+      const body = await response.json();
+      expect(body.status).toBe('invalid_order');
+      expect(body.message).toBe('Order validation failed.');
+    }
+  });
+
+  test('rejects invalid scenario values before automation', async () => {
+    const order = createOrder();
+    order.customerType = 'sideways';
+    const response = await orderRequest(order);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.status).toBe('invalid_order');
+    expect(body.message).toBe('Order validation failed.');
+  });
+
+  test('rejects malformed JSON with a useful client error', async () => {
+    const response = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_TOKEN}` },
+      body: '{invalid'
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      status: 'invalid_json',
+      message: 'Request body contains invalid JSON.'
+    });
   });
 
   test('accepts a valid demo order through the mock runner', async () => {
@@ -149,6 +189,35 @@ test.describe('AllConnect API tests', () => {
     expect(body.status).toBe('completed');
     expect(body.summary.totalSteps).toBe(21);
     expect(body.safetyCheckpoint.finalOrderSubmitted).toBe(false);
+  });
+
+  test('returns safe-stop status without indicating final submission', async () => {
+    stoppedSafely = true;
+    try {
+      const response = await orderRequest(createOrder());
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.status).toBe('stopped_safely');
+      expect(body.safetyCheckpoint.finalOrderSubmitted).toBe(false);
+    } finally {
+      stoppedSafely = false;
+    }
+  });
+
+  test('returns a sanitized server error when automation throws and releases execution lock', async () => {
+    failAutomation = true;
+    try {
+      const response = await orderRequest(createOrder());
+      expect(response.status).toBe(500);
+      const body = await response.json();
+      expect(body.status).toBe('failed');
+      expect(body.message).not.toContain('controlled runner failure');
+    } finally {
+      failAutomation = false;
+    }
+
+    const nextResponse = await orderRequest(createOrder());
+    expect(nextResponse.status).toBe(200);
   });
 
   test('rejects a second order while automation is running', async () => {

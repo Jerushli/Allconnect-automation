@@ -4,3 +4,13 @@ playwright-report/
 test-results/
 reports/*
 !reports/.gitkeep
+# Local sensitive-data POC
+secure-data/
+
+# Local sensitive data
+/secure-data/
+
+# Local portal inspection artifacts
+/*.png
+/*.log
+/order-summary-search.txt

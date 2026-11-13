@@ -1,0 +1,55 @@
+{
+  "customer": {
+    "firstName": "Demo",
+    "middleInitial": "",
+    "lastName": "Transfer",
+    "zipCode": "12207",
+    "streetAddress": "123 ple Street",
+    "unitType": "Apartment",
+    "unitNumber": "1",
+    "city": "Sample City",
+    "state": "NY",
+    "residenceType": "Apartment",
+    "ownership": "Rent",
+    "leadId": "",
+    "moving": "Yes",
+    "moveInDate": "12/01/2026",
+    "prefix": "Mr",
+    "phone": "2025550102",
+    "email": "transfer@example.test"
+  },
+  "customerType": "Transfer",
+  "provider": "ProviderXX",
+  "speedMbps": 300,
+  "videoBundle": false,
+  "phoneService": false,
+  "equipment": "provider-modem",
+  "creditScenario": "approved-mock-profile",
+  "plan": {
+    "term": "1-year",
+    "monthlyPrice": 40,
+    "installationPrice": 0
+  },
+  "accountHolder": {
+    "isAccountHolder": true,
+    "isExistingProviderCustomer": false,
+    "ezEnroll": false,
+    "automaticPayments": true,
+    "readAcknowledgement": true,
+    "mailingAddressSameAsService": true,
+    "shippingAddressSameAsService": true
+  },
+  "execution": {
+    "mode": "demo",
+    "stopBeforeFinalOrderSubmission": true
+  },
+  "checkout": {
+    "broadbandFactLabels": "not_requested",
+    "broadbandFactLabelsRead": true,
+    "equipment": "leased_gateway",
+    "nowTv": false
+  },
+  "installation": {
+    "type": "standard_shipping"
+  }
+}

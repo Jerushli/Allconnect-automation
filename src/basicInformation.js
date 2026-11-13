@@ -1,22 +1,21 @@
 
+const { captureRedactedScreenshot } = require('./diagnostics');
+
 async function inspectBasicInformation(page) {
+  if (process.env.AUTOMATION_DIAGNOSTICS !== 'true') return;
   console.log('\n--- BASIC INFORMATION PAGE ---');
   console.log('\n--- VISIBLE INPUT FIELD DETAILS ---');
 
-const inputDetails = await page.locator('input, textarea').evaluateAll(elements =>
-  elements.map(element => ({
-    tag: element.tagName,
-    type: element.type || '',
-    id: element.id,
-    name: element.name,
-    placeholder: element.placeholder,
-    ariaLabel: element.getAttribute('aria-label'),
-    value: element.value,
-    visible: !!(element.offsetWidth || element.offsetHeight)
-  }))
-);
+  const inputDetails = await page.locator('input, textarea').evaluateAll(elements =>
+    elements.map(element => ({
+      tag: element.tagName,
+      type: element.type || '',
+      visible: !!(element.offsetWidth || element.offsetHeight)
+    }))
+  );
 
-console.log(inputDetails);
+  console.log(inputDetails);
+
   const fields = [
     '#namePrefixList',
     '#unitTypeList',
@@ -48,8 +47,7 @@ console.log(inputDetails);
     if (tagName === 'SELECT') {
       const options = await field.first().locator('option').evaluateAll(
         elements => elements.map(option => ({
-          label: option.label,
-          value: option.value
+          label: option.label
         }))
       );
 
@@ -57,14 +55,89 @@ console.log(inputDetails);
     }
   }
 
-  await page.screenshot({
-    path: 'basic-information-debug.png',
-    fullPage: true
-  });
+  await captureRedactedScreenshot(page, 'basic-information-debug.png');
 
   console.log('Inspection completed.');
 }
 
+
+// Find and fill the moving date when the portal displays that field.
+async function fillMovingDate(page, moveInDate) {
+  console.log('\n--- MOVING DATE HANDLING ---');
+
+  if (!moveInDate) {
+    throw new Error(
+      'Moving date is required when the customer moving option is Yes.'
+    );
+  }
+
+  const dateFieldCandidates = [
+    'input[type="date"]',
+    '#moveInDate',
+    '#movingDate',
+    '#customerMoveDate',
+    'input[name*="moveInDate" i]',
+    'input[name*="movingDate" i]',
+    'input[id*="moveInDate" i]',
+    'input[id*="movingDate" i]',
+    'input[placeholder*="move" i]',
+    'input[aria-label*="move" i]'
+  ];
+
+  let dateField = null;
+
+  for (const selector of dateFieldCandidates) {
+    const candidate = page.locator(selector).filter({
+      visible: true
+    }).first();
+
+    try {
+      if (await candidate.count() > 0 && await candidate.isVisible()) {
+        dateField = candidate;
+        console.log('Moving date field found:', selector);
+        break;
+      }
+    } catch (error) {
+      // Continue checking the remaining selectors.
+    }
+  }
+
+  if (!dateField) {
+    throw new Error(
+      'Moving date field was not found. Inspect the Basic Information page to identify its actual selector.'
+    );
+  }
+
+  await dateField.waitFor({
+    state: 'visible',
+    timeout: 10000
+  });
+
+  const fieldType = await dateField.getAttribute('type');
+  const suppliedDate = String(moveInDate).trim();
+  let dateForField = suppliedDate;
+
+  // HTML date controls only accept ISO dates, while scenario files commonly
+  // use the portal's display format (MM/DD/YYYY).
+  if (fieldType === 'date' && /^\d{2}\/\d{2}\/\d{4}$/.test(suppliedDate)) {
+    const [month, day, year] = suppliedDate.split('/');
+    dateForField = `${year}-${month}-${day}`;
+  }
+
+  await dateField.fill(dateForField);
+
+  const actualDate = await dateField.inputValue();
+
+  if (actualDate !== dateForField) {
+    throw new Error(
+      'Moving date verification failed.'
+    );
+  }
+
+  await dateField.evaluate(field => field.blur());
+
+  console.log('Moving date entered and verified.');
+}
 
 
 async function fillBasicInformation(page, customer) {
@@ -108,6 +181,7 @@ async function fillBasicInformation(page, customer) {
 
   // 6. Select state and dwelling details
   await page.locator('#stateList').selectOption(customer.state);
+
   await page.locator('#serviceAddressTypeList')
     .selectOption(customer.serviceAddressType);
 
@@ -126,23 +200,47 @@ async function fillBasicInformation(page, customer) {
   await unitTypeField.selectOption(customer.unitType);
 
   await page.locator('#rentOwnList').selectOption(customer.rentOwn);
-  await page.locator('#customerMove').selectOption(customer.customerMove);
 
-  // 7. Fill call ID
+  // 7. Select customer moving option
+  const customerMoveField = page.locator('#customerMove');
+
+  await customerMoveField.waitFor({
+    state: 'visible',
+    timeout: 10000
+  });
+
+  await customerMoveField.selectOption(customer.customerMove);
+
+  console.log('Customer moving option selected:', customer.customerMove);
+
+  // 8. Enter moving date when the scenario requires it
+  const movingValue = String(customer.customerMove)
+    .trim()
+    .toLowerCase();
+
+  const isMoving =
+    movingValue === 'yes' ||
+    movingValue === 'true' ||
+    movingValue === '1';
+
+  if (isMoving) {
+    await fillMovingDate(page, customer.moveInDate);
+  } else {
+    console.log('Moving date not required for this customer.');
+  }
+
+  // 9. Fill call ID
   const callIdField = page.locator('#rvCallID');
 
-    await callIdField.fill(customer.callId);
+  await callIdField.fill(customer.callId);
 
-    console.log('Call ID entered:', await callIdField.inputValue());
+  console.log('Call ID entered.');
 
-    await callIdField.evaluate(field => field.blur());
+  await callIdField.evaluate(field => field.blur());
 
-    console.log('Call ID after blur:', await callIdField.inputValue());
+  console.log('Call ID field blur completed.');
 
-    console.log('Call ID field details:',await callIdField.evaluate(field => ({maxLength: field.maxLength,currentValue: field.value,characterCount: field.value.length
-  }))
-);
-  // 8. Verify entered text fields
+  // 10. Verify entered text fields
   const textFields = {
     '#firstName': customer.firstName,
     '#lastName': customer.lastName,
@@ -157,37 +255,39 @@ async function fillBasicInformation(page, customer) {
     const actual = await page.locator(selector).inputValue();
 
     if (actual !== expected) {
-      throw new Error(`Verification failed for ${selector}`);
+      throw new Error(
+        `Verification failed for customer field ${selector}.`
+      );
     }
   }
 
   console.log('All Basic Information text fields verified.');
 
-  await page.screenshot({
-    path: 'basic-information-filled.png',
-    fullPage: true
-  });
+  // 11. Verify dropdown selections
   const dropdownFields = {
-  '#namePrefixList': customer.prefix,
-  '#unitTypeList': customer.unitType,
-  '#stateList': customer.state,
-  '#serviceAddressTypeList': customer.serviceAddressType,
-  '#rentOwnList': customer.rentOwn,
-  '#customerMove': customer.customerMove
-};
+    '#namePrefixList': customer.prefix,
+    '#unitTypeList': customer.unitType,
+    '#stateList': customer.state,
+    '#serviceAddressTypeList': customer.serviceAddressType,
+    '#rentOwnList': customer.rentOwn,
+    '#customerMove': customer.customerMove
+  };
 
-for (const [selector, expected] of Object.entries(dropdownFields)) {
-  const actual = await page.locator(selector).inputValue();
+  for (const [selector, expected] of Object.entries(dropdownFields)) {
+    const actual = await page.locator(selector).inputValue();
 
-  console.log(`${selector}: ${actual}`);
-
-  if (actual !== expected) {
-    throw new Error(`Dropdown verification failed for ${selector}`);
+    if (actual !== expected) {
+      throw new Error(
+        `Dropdown verification failed for ${selector}.`
+      );
+    }
   }
-}
 
-console.log('All dropdown selections verified.');
-  console.log('Filled form screenshot saved.');
+  console.log('All dropdown selections verified.');
+
+  if (process.env.AUTOMATION_DIAGNOSTICS === 'true') {
+    console.log('Filled-form screenshot omitted to prevent sensitive capture.');
+  }
 }
 
 

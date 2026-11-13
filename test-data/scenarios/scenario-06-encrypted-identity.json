@@ -1,0 +1,59 @@
+{
+  "customer": {
+    "firstName": "Demo",
+    "middleInitial": "",
+    "lastName": "Encrypted",
+    "zipCode": "12207",
+    "streetAddress": "123 ple Street",
+    "unitType": "Apartment",
+    "unitNumber": "1",
+    "city": "Sample City",
+    "state": "NY",
+    "residenceType": "Apartment",
+    "ownership": "Rent",
+    "leadId": "",
+    "moving": "No",
+    "moveInDate": "",
+    "prefix": "Mr",
+    "phone": "2025550104",
+    "email": "encrypted@example.test"
+  },
+  "customerType": "New",
+  "provider": "ProviderXX",
+  "speedMbps": 300,
+  "videoBundle": false,
+  "phoneService": false,
+  "equipment": "provider-modem",
+  "creditScenario": "approved-mock-profile",
+  "plan": {
+    "term": "1-year",
+    "monthlyPrice": 40,
+    "installationPrice": 0
+  },
+  "accountHolder": {
+    "isAccountHolder": true,
+    "isExistingProviderCustomer": false,
+    "ezEnroll": false,
+    "automaticPayments": true,
+    "readAcknowledgement": true,
+    "mailingAddressSameAsService": true,
+    "shippingAddressSameAsService": true
+  },
+  "identity": {
+    "ssnRecordId": "2ae710f5-ed54-42f1-a8ef-7be9afb4aabd",
+    "dateOfBirthRecordId": "47bc66c9-0e04-404a-b318-9f13cb08d0a2"
+  },
+  "execution": {
+    "mode": "demo",
+    "stopBeforeFinalOrderSubmission": true
+  },
+  "checkout": {
+    "broadbandFactLabels": "not_requested",
+    "broadbandFactLabelsRead": true,
+    "equipment": "leased_gateway",
+    "nowTv": false
+  },
+  "installation": {
+    "type": "standard_shipping"
+  }
+}
