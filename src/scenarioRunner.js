@@ -140,7 +140,7 @@ async function runScenarioSelection(answer, options = {}) {
 
   const execute = options.runAutomation || runAutomation;
   const report = await execute(automationInput);
-  log('Scenario result:', selectedFile, report.status || 'completed');
+  log('Scenario result:', selectedFile, report.status || 'unknown');
   return { selectedFile, report, automationInput };
 }
 
@@ -181,7 +181,7 @@ async function main() {
     if (!selection) return;
     console.log('\n========== RESULT ==========');
     console.log('Scenario:', selection.selectedFile);
-    console.log('Status:', selection.report.status || 'completed');
+    console.log('Status:', selection.report.status || 'unknown');
     console.log('Summary:', selection.report.summary || {});
 
   } catch (error) {

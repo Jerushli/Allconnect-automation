@@ -122,7 +122,7 @@ function createApp(options = {}) {
 
         return res.status(200).json({
           runId,
-          status: report.status || 'completed',
+          status: report.status || 'unknown',
           summary: report.summary || {},
           steps: report.steps || [],
           safetyCheckpoint: report.safetyCheckpoint || {

@@ -2782,36 +2782,20 @@ if (input.installation.type === 'professional_installation') {
 
   console.log('[VERIFIED] Installation date and preferred time selected.');
   }
-
-  // STEP 1: CONFIRM INSTALLATION.
-  console.log('\n========================================');
-  console.log('CONFIRMING INSTALLATION');
-  console.log('========================================');
-
-  const confirmInstallationButton = checkoutFrame.locator(
-    'input[type="button"][value="Confirm Installation >"]'
+  // SAFETY STOP: Do not confirm installation until the portal action
+  // and its resulting state have been independently verified.
+  console.log(
+    '[SAFE STOP] Installation option selected and verified. ' +
+    'Confirm Installation was not clicked.'
   );
 
-  if (await confirmInstallationButton.count() !== 1) {
-    throw new Error(
-      'Expected exactly one Confirm Installation button.'
-    );
-  }
+  result.installation.confirmationClicked = false;
+  result.installation.confirmed = false;
+  result.stoppedSafely = true;
+  result.stopReason =
+    'Stopped before Confirm Installation; portal action semantics have not been verified.';
 
-  await confirmInstallationButton.waitFor({
-    state: 'visible',
-    timeout: 15000
-  });
-
-  if (!(await confirmInstallationButton.isEnabled())) {
-    throw new Error('Confirm Installation button is disabled.');
-  }
-
-  await confirmInstallationButton.click();
-
-  console.log('[COMPLETED] Confirm Installation clicked.');
-
-  result.installation.confirmed = true;
+  return result;
 
   // STEP 2: WAIT FOR THE FORWARD BUTTON.
   console.log('\nWaiting for the next Forward button...');
@@ -3555,7 +3539,11 @@ console.log(
         ? '[COMPLETED] Credit check simulated locally.'
         : '[SKIPPED] Credit check not required or not performed.'
     );
-    console.log('[COMPLETED] Installation confirmed.');
+    console.log(
+  demoCheckoutResult.installation.confirmed
+    ? '[VERIFIED] Installation confirmation verified.'
+    : '[NOT CONFIRMED] Installation confirmation was not verified.'
+);
     console.log(
       demoCheckoutResult.payment.fieldsInspected
         ? '[SAFE STOP] Payment fields inspected; no card details entered.'
@@ -3567,7 +3555,10 @@ console.log(
       finishExecutionStep('completed');
       executionReport.status = 'completed';
     } else if (demoCheckoutResult.stoppedSafely) {
-      console.log('[SAFE STOP] Workflow intentionally stopped before payment.');
+      console.log(
+  '[SAFE STOP] Workflow stopped before Confirm Installation. ' +
+  'Order Summary has not been reached.'
+);
       finishExecutionStep('stopped_safely');
       executionReport.status = 'stopped_safely';
     } else {
@@ -3668,13 +3659,16 @@ if (keepBrowserOpen) {
     console.log('========================================');
     console.log('CHECKOUT_COMPLETED: VERIFIED');
   } else if (executionReport.status === 'stopped_safely') {
-    console.log('PAYMENT PAGE - SAFE STOP');
-    console.log('========================================');
-    console.log('PAYMENT_FIELDS_INSPECTED: VERIFIED');
-    console.log('CARD_DETAILS_ENTERED: NO');
-    console.log('PAYMENT_FORWARD_CLICKED: NO');
-    console.log('ORDER_SUMMARY_REACHED: NO');
-  } else {
+  console.log('SAFE STOP - INSTALLATION CONFIRMATION NOT PERFORMED');
+  console.log('========================================');
+  console.log('INSTALLATION_OPTION_VERIFIED:',
+    executionReport.installation?.verified === true ? 'YES' : 'NO');
+  console.log('INSTALLATION_CONFIRMATION_CLICKED: NO');
+  console.log('PAYMENT_PERFORMED: NO');
+  console.log('FINAL_ORDER_SUBMITTED: NO');
+  console.log('ORDER_SUMMARY_REACHED:',
+    executionReport.orderSummaryReached === true ? 'YES' : 'NO');
+} else {
     console.log('BROWSER LEFT OPEN FOR INSPECTION');
     console.log('========================================');
     console.log('Order Summary has not been verified.');
@@ -3715,6 +3709,7 @@ module.exports = {
   hasVerifiedOrderSummary,
   clickForwardAndVerifyOrderSummary,
   selectInstallationOption,
+  completeDemoCheckout,
   openInternetOffers
 };
 
@@ -3839,7 +3834,7 @@ if (require.main === module) {
 
             installation: {
         type: sampleOrder.installation.type,
-        confirmInstallation: true
+        confirmInstallation: false
       },
 
       payment: {
