@@ -1,3 +1,4 @@
+
 const { test, expect } = require('@playwright/test');
 
 const {
@@ -8,6 +9,7 @@ const {
   resolveScenarioSelection,
   runScenarioSelection
 } = require('../src/scenarioRunner');
+
 const { validateInput } = require('../src/main');
 
 const scenarioFiles = listScenarioFiles();
@@ -49,6 +51,7 @@ for (const fileName of scenarioFiles) {
   test(`${fileName} runner executes only the selected scenario`, async () => {
     let capturedInput;
     const expected = { status: 'stubbed' };
+
     const result = await runScenarioFile(fileName, {
       runAutomation: async input => {
         capturedInput = input;
@@ -57,7 +60,9 @@ for (const fileName of scenarioFiles) {
     });
 
     expect(result).toBe(expected);
-    expect(capturedInput.customer.lastName).toBe(loadScenario(fileName).customer.lastName);
+    expect(capturedInput.customer.lastName).toBe(
+      loadScenario(fileName).customer.lastName
+    );
   });
 }
 
@@ -68,16 +73,26 @@ test('scenario loader rejects paths outside the scenario directory', () => {
 });
 
 test('scenario runner resolves numeric and named selections to the intended file', () => {
-  expect(resolveScenarioSelection('4', scenarioFiles)).toBe('scenario-04-ez-enroll.json');
-  expect(resolveScenarioSelection('scenario-05-professional-installation.json', scenarioFiles))
-    .toBe('scenario-05-professional-installation.json');
+  expect(resolveScenarioSelection('4', scenarioFiles))
+    .toBe('scenario-04-ez-enroll.json');
+
+  expect(
+    resolveScenarioSelection(
+      'scenario-05-professional-installation.json',
+      scenarioFiles
+    )
+  ).toBe('scenario-05-professional-installation.json');
+
   expect(resolveScenarioSelection('0', scenarioFiles)).toBeNull();
-  expect(() => resolveScenarioSelection('7', scenarioFiles)).toThrow(/Invalid selection/);
+
+  expect(() => resolveScenarioSelection('7', scenarioFiles))
+    .toThrow(/Invalid selection/);
 });
 
 test('numeric scenario selection executes the selected JSON and reports progress', async () => {
   let receivedInput;
   const progress = [];
+
   const result = await runScenarioSelection('4', {
     files: scenarioFiles,
     log: (...parts) => progress.push(parts.join(' ')),
@@ -92,5 +107,24 @@ test('numeric scenario selection executes the selected JSON and reports progress
   expect(receivedInput.installation.type).toBe('standard_shipping');
   expect(result.report.status).toBe('stopped_safely');
   expect(progress.join('\n')).toContain('Input validation passed.');
-  expect(progress.join('\n')).toContain('Scenario result: scenario-04-ez-enroll.json stopped_safely');
+  expect(progress.join('\n')).toContain(
+    'Scenario result: scenario-04-ez-enroll.json stopped_safely'
+  );
+});
+
+test('scenario runner reports unknown when automation report omits status', async () => {
+  const progress = [];
+
+  const result = await runScenarioSelection('4', {
+    files: scenarioFiles,
+    log: (...parts) => progress.push(parts.join(' ')),
+    runAutomation: async () => ({})
+  });
+
+  expect(result.selectedFile).toBe('scenario-04-ez-enroll.json');
+  expect(result.report).toEqual({});
+
+  expect(progress.join('\n')).toContain(
+    'Scenario result: scenario-04-ez-enroll.json unknown'
+  );
 });

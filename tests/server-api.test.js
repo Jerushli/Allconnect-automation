@@ -14,6 +14,7 @@ let releaseAutomation;
 let automationStarted;
 let stoppedSafely = false;
 let failAutomation = false;
+let missingStatus = false;
 
 const mockReport = {
   status: 'completed',
@@ -34,6 +35,7 @@ const mockReport = {
 
 async function mockRunAutomation(input) {
   if (failAutomation) throw new Error('controlled runner failure');
+
   if (holdAutomation) {
     automationStarted = new Promise(resolve => {
       resolveAutomationStarted = resolve;
@@ -46,8 +48,17 @@ async function mockRunAutomation(input) {
     });
   }
 
+  if (missingStatus) {
+    const { status, ...reportWithoutStatus } = mockReport;
+    return reportWithoutStatus;
+  }
+
   return stoppedSafely
-    ? { ...mockReport, status: 'stopped_safely', safetyCheckpoint: { ...mockReport.safetyCheckpoint } }
+    ? {
+        ...mockReport,
+        status: 'stopped_safely',
+        safetyCheckpoint: { ...mockReport.safetyCheckpoint }
+      }
     : mockReport;
 }
 
@@ -148,9 +159,13 @@ test.describe('AllConnect API tests', () => {
     for (const field of ['lastName', 'city', 'zipCode', 'email']) {
       const order = createOrder();
       delete order.customer[field];
+
       const response = await orderRequest(order);
+
       expect(response.status, `missing ${field}`).toBe(400);
+
       const body = await response.json();
+
       expect(body.status).toBe('invalid_order');
       expect(body.message).toBe('Order validation failed.');
     }
@@ -159,9 +174,13 @@ test.describe('AllConnect API tests', () => {
   test('rejects invalid scenario values before automation', async () => {
     const order = createOrder();
     order.customerType = 'sideways';
+
     const response = await orderRequest(order);
+
     expect(response.status).toBe(400);
+
     const body = await response.json();
+
     expect(body.status).toBe('invalid_order');
     expect(body.message).toBe('Order validation failed.');
   });
@@ -169,10 +188,15 @@ test.describe('AllConnect API tests', () => {
   test('rejects malformed JSON with a useful client error', async () => {
     const response = await fetch(`${baseUrl}/api/orders`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_TOKEN}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${API_TOKEN}`
+      },
       body: '{invalid'
     });
+
     expect(response.status).toBe(400);
+
     expect(await response.json()).toEqual({
       status: 'invalid_json',
       message: 'Request body contains invalid JSON.'
@@ -193,10 +217,14 @@ test.describe('AllConnect API tests', () => {
 
   test('returns safe-stop status without indicating final submission', async () => {
     stoppedSafely = true;
+
     try {
       const response = await orderRequest(createOrder());
+
       expect(response.status).toBe(200);
+
       const body = await response.json();
+
       expect(body.status).toBe('stopped_safely');
       expect(body.safetyCheckpoint.finalOrderSubmitted).toBe(false);
     } finally {
@@ -204,12 +232,33 @@ test.describe('AllConnect API tests', () => {
     }
   });
 
-  test('returns a sanitized server error when automation throws and releases execution lock', async () => {
-    failAutomation = true;
+  test('returns unknown when automation report omits status', async () => {
+    missingStatus = true;
+
     try {
       const response = await orderRequest(createOrder());
-      expect(response.status).toBe(500);
+
+      expect(response.status).toBe(200);
+
       const body = await response.json();
+
+      expect(body.status).toBe('unknown');
+      expect(body.safetyCheckpoint.finalOrderSubmitted).toBe(false);
+    } finally {
+      missingStatus = false;
+    }
+  });
+
+  test('returns a sanitized server error when automation throws and releases execution lock', async () => {
+    failAutomation = true;
+
+    try {
+      const response = await orderRequest(createOrder());
+
+      expect(response.status).toBe(500);
+
+      const body = await response.json();
+
       expect(body.status).toBe('failed');
       expect(body.message).not.toContain('controlled runner failure');
     } finally {
@@ -217,6 +266,7 @@ test.describe('AllConnect API tests', () => {
     }
 
     const nextResponse = await orderRequest(createOrder());
+
     expect(nextResponse.status).toBe(200);
   });
 
