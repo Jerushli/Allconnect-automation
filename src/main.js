@@ -57,6 +57,21 @@ function sanitizeExecutionReport(report) {
       return redactDiagnosticText(value);
     }
     if (Array.isArray(value)) {
+      if (key === 'routeResponses') {
+  return value.map(item => ({
+    path: [
+      '/allconnect-frame/order-summary',
+      '/allconnect-frame/order-summary/'
+    ].includes(item?.path)
+      ? item.path
+      : '[redacted]',
+    status: Number.isInteger(item?.status) &&
+      item.status >= 100 &&
+      item.status <= 599
+        ? item.status
+        : '[redacted]'
+  }));
+}
       if (key === 'controls') {
         const allowed = new Set(['tag', 'type', 'text', 'disabled', 'required', 'insideForm', 'formActionPresent', 'formMethod', 'onclickPresent', 'checked', 'ariaInvalid', 'valid']);
         return value.map(control => Object.fromEntries(Object.entries(control || {})
@@ -2291,104 +2306,224 @@ creditCheckStage = 'credit_result_read_completed';
 async function inspectCheckoutNavigation(checkoutFrame) {
   return checkoutFrame.locator('html').evaluate(html => {
     const document = html.ownerDocument;
+
     const safeLabel = value => {
       const label = String(value || '').trim();
       const allowed = [
-        'Order Summary', 'Credit Check', 'Order Qualification Status',
-        'Installation and Payment', 'Installation & Payment',
-        'ProviderXX Checkout', 'Account Holder Qualification',
-        'Product Customization', 'Installation', 'Authorization'
+        'Order Summary',
+        'Credit Check',
+        'Order Qualification Status',
+        'Installation and Payment',
+        'Installation & Payment',
+        'ProviderXX Checkout',
+        'Account Holder Qualification',
+        'Product Customization',
+        'Installation',
+        'Authorization'
       ];
-      return allowed.includes(label) ? label : label ? '[redacted]' : '';
+
+      return allowed.includes(label)
+        ? label
+        : label ? '[redacted]' : '';
     };
+
     const safeUrl = value => {
       try {
-        const url = new URL(value);
+        const url = new URL(value, document.location.href);
+
         const allowedPaths = new Set([
-          '/', '/allconnect-frame/order-summary/',
-          '/allconnect-frame/recommendations/', '/allconnect-frame/internet-offers/'
+          '/',
+          '/allconnect-frame/order-summary/',
+          '/allconnect-frame/recommendations/',
+          '/allconnect-frame/internet-offers/',
+          '/allconnect-frame/checkout/',
+          '/allconnect-frame/installation-payment/'
         ]);
-        const path = url.pathname === '/' ? '/' : `${url.pathname.replace(/\/+$/, '')}/`;
+
+        const path = url.pathname === '/'
+          ? '/'
+          : `${url.pathname.replace(/\/+$/, '')}/`;
+
         return `${url.origin}${allowedPaths.has(path) ? path : '/[redacted-path]'}`;
       } catch {
         return '[unavailable]';
       }
     };
+
     const isVisible = element => {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0;
+
+      return style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0;
     };
+
+    const getFormDetails = form => {
+      if (!form) return null;
+
+      const submitControls = Array.from(form.querySelectorAll(
+        'button, input[type="submit"], input[type="image"]'
+      ));
+
+      return {
+        present: true,
+        idPresent: Boolean(form.id),
+        actionPresent: Boolean(form.getAttribute('action')),
+        action: safeUrl(form.action),
+        method: (form.getAttribute('method') || 'get').toUpperCase(),
+        enctype: form.enctype || '',
+        target: ['_self', '_blank', '_parent', '_top'].includes(
+          form.getAttribute('target')
+        ) ? form.getAttribute('target') : '[redacted]',
+        inlineOnsubmitPresent: Boolean(form.getAttribute('onsubmit')),
+        submitControlCount: submitControls.length
+      };
+    };
+
     const controls = Array.from(document.querySelectorAll(
       'button, input:not([type="hidden"]), select, textarea, a'
-    )).filter(isVisible).map(element => ({
-      tag: element.tagName,
-      type: element.getAttribute('type'),
-      text: (() => {
-        const candidate = element.tagName === 'BUTTON' ||
-          (element.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(element.type))
-          ? (element.innerText || element.value || '').trim()
-          : '';
-        return ['Forward >', 'Forward', 'Run Credit Check', 'Confirm Installation >'].includes(candidate)
-          ? candidate
-          : '';
-      })(),
-      disabled: Boolean(element.disabled),
-      required: Boolean(element.required),
-      insideForm: Boolean(element.form),
-      formActionPresent: Boolean(element.form?.getAttribute('action')),
-      formMethod: element.form?.getAttribute('method') || '',
-      onclickPresent: Boolean(element.getAttribute('onclick')),
-      checked: typeof element.checked === 'boolean' ? element.checked : undefined,
-      ariaInvalid: element.getAttribute('aria-invalid') === 'true',
-      valid: typeof element.checkValidity === 'function' ? element.checkValidity() : undefined,
-    }));
-    const forms = { count: document.forms.length };
+    ))
+      .filter(isVisible)
+      .map(element => {
+        const candidate =
+          element.tagName === 'BUTTON' ||
+          (
+            element.tagName === 'INPUT' &&
+            ['button', 'submit', 'reset'].includes(element.type)
+          )
+            ? (element.innerText || element.value || '').trim()
+            : '';
+
+        const allowedActions = [
+          'Forward >',
+          'Forward',
+          'Run Credit Check',
+          'Confirm Installation >'
+        ];
+
+        const form = element.form || null;
+        const formAction = element.getAttribute('formaction');
+
+        return {
+          tag: element.tagName,
+          type: element.getAttribute('type'),
+          text: allowedActions.includes(candidate) ? candidate : '',
+          disabled: Boolean(element.disabled),
+          required: Boolean(element.required),
+
+          insideForm: Boolean(form),
+          formDetails: getFormDetails(form),
+
+          formActionPresent: Boolean(formAction),
+          formAction: formAction ? safeUrl(formAction) : null,
+
+          onclickPresent: Boolean(element.getAttribute('onclick')),
+
+          checked: typeof element.checked === 'boolean'
+            ? element.checked
+            : undefined,
+
+          ariaInvalid: element.getAttribute('aria-invalid') === 'true',
+
+          valid: typeof element.checkValidity === 'function'
+            ? element.checkValidity()
+            : undefined
+        };
+      });
+
+    const forms = {
+      count: document.forms.length
+    };
+
     const headings = Array.from(document.querySelectorAll(
       'h1, h2, h3, h4, legend, [role="heading"]'
-    )).filter(isVisible).map(element => safeLabel(element.innerText)).filter(Boolean);
+    ))
+      .filter(isVisible)
+      .map(element => safeLabel(element.innerText))
+      .filter(Boolean);
+
     const bodyText = document.body.innerText || '';
+
     const relevantMessages = [
-      /credit check status/i.test(bodyText) ? 'credit_check_status_present' : null,
-      /payment|card/i.test(bodyText) ? 'payment_text_present' : null,
-      /error|required|invalid/i.test(bodyText) ? 'validation_text_present' : null,
-      /order summary/i.test(bodyText) ? 'order_summary_text_present' : null,
-      /forward/i.test(bodyText) ? 'forward_text_present' : null
+      /credit check status/i.test(bodyText)
+        ? 'credit_check_status_present' : null,
+      /payment|card/i.test(bodyText)
+        ? 'payment_text_present' : null,
+      /error|required|invalid/i.test(bodyText)
+        ? 'validation_text_present' : null,
+      /order summary/i.test(bodyText)
+        ? 'order_summary_text_present' : null,
+      /forward/i.test(bodyText)
+        ? 'forward_text_present' : null
     ].filter(Boolean);
+
     const scriptCount = document.scripts.length;
+
     const bodyDataset = {};
+
     for (const key of ['acPage', 'sveltekitPreloadData']) {
       const value = document.body.dataset[key];
-      if (key === 'acPage' && ['order-summary', 'installation-payment', 'recommendations', 'internet-offers'].includes(value)) bodyDataset[key] = value;
-      if (key === 'sveltekitPreloadData' && ['hover', 'tap'].includes(value)) bodyDataset[key] = value;
+
+      if (
+        key === 'acPage' &&
+        [
+          'order-summary',
+          'installation-payment',
+          'recommendations',
+          'internet-offers'
+        ].includes(value)
+      ) {
+        bodyDataset[key] = value;
+      }
+
+      if (
+        key === 'sveltekitPreloadData' &&
+        ['hover', 'tap'].includes(value)
+      ) {
+        bodyDataset[key] = value;
+      }
     }
+
+    const javascriptResourceCount = performance
+      .getEntriesByType('resource')
+      .filter(entry => /\.(m?js)(\?|$)/i.test(entry.name))
+      .length;
+
     return {
       url: safeUrl(document.location.href),
       title: safeLabel(document.title),
       bodyDataset,
+
       summaryFormPresent: (() => {
         const form = document.querySelector('#summaryForm');
         return Boolean(form && isVisible(form));
       })(),
+
       headings,
       relevantMessages,
-      javascriptResourceCount: performance.getEntriesByType('resource')
-        .map(entry => entry.name)
-        .filter(url => /\.(m?js)(\?|$)/i.test(url)).length,
+      javascriptResourceCount,
+
       renderState: {
         readyState: document.readyState,
         bodyTextPresent: bodyText.trim().length > 0,
         bodyTextLength: bodyText.length,
         scriptElementCount: scriptCount,
-        visibleHeadingCount: Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).filter(isVisible).length,
+        visibleHeadingCount: Array.from(
+          document.querySelectorAll(
+            'h1,h2,h3,h4,h5,h6,[role="heading"]'
+          )
+        ).filter(isVisible).length,
         visibleControlCount: controls.length
       },
+
       forms,
       controls
     };
   });
 }
+
 
 async function collectOrderSummaryEvidence(checkoutFrame, input) {
   const installationOptionFee =
@@ -2671,10 +2806,12 @@ async function clickForwardAndVerifyOrderSummary(
 
 function hasVerifiedOrderSummary(evidence) {
   return Boolean(
-    evidence?.summaryHeading &&
-    (evidence.summaryFormPresent || evidence.summaryState) &&
-    Object.values(evidence.expectedFields || {}).length > 0 &&
-    Object.values(evidence.expectedFields || {}).every(Boolean)
+    evidence?.summaryHeading === true &&
+    evidence?.summaryFormPresent === true &&
+    evidence?.expectedFields?.customerName === true &&
+    evidence?.expectedFields?.provider === true &&
+    evidence?.expectedFields?.monthlyPrice === true &&
+    evidence?.expectedFields?.installationPrice === true
   );
 }
 

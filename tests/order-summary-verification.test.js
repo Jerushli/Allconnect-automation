@@ -219,3 +219,104 @@ test('empty summary route times out with diagnostics and is not counted as reach
   expect(result.summaryEvidence.renderWait.summaryRouteDetected).toBe(true);
   expect(await page.evaluate(() => window.__forwardClickCount)).toBe(1);
 });
+test('summary state without a visible summary form is rejected', () => {
+  expect(hasVerifiedOrderSummary({
+    summaryHeading: true,
+    summaryState: true,
+    summaryFormPresent: false,
+    expectedFields: {
+      customerName: true,
+      provider: true,
+      monthlyPrice: true,
+      installationPrice: true
+    }
+  })).toBe(false);
+});
+
+test('summary without a heading is rejected even when all fields match', () => {
+  expect(hasVerifiedOrderSummary({
+    summaryHeading: false,
+    summaryState: true,
+    summaryFormPresent: true,
+    expectedFields: {
+      customerName: true,
+      provider: true,
+      monthlyPrice: true,
+      installationPrice: true
+    }
+  })).toBe(false);
+});
+
+test('summary with any missing expected field is rejected', () => {
+  expect(hasVerifiedOrderSummary({
+    summaryHeading: true,
+    summaryFormPresent: true,
+    expectedFields: {
+      customerName: true,
+      provider: true,
+      monthlyPrice: false,
+      installationPrice: true
+    }
+  })).toBe(false);
+});
+test('Order Summary report preserves verification booleans but redacts customer data', () => {
+  const safe = sanitizeExecutionReport({
+    orderSummaryVerification: {
+      summaryHeading: true,
+      summaryFormPresent: true,
+      summaryState: true,
+      expectedFields: {
+        customerName: true,
+        provider: true,
+        monthlyPrice: true,
+        installationPrice: true
+      },
+      customerName: 'PRIVATE_CUSTOMER_SENTINEL',
+      bodyText: 'PRIVATE_BODY_SENTINEL',
+      url: 'https://portal.test/allconnect-frame/order-summary/?token=PRIVATE_TOKEN'
+    }
+  });
+
+  const serialized = JSON.stringify(safe);
+
+  expect(safe.orderSummaryVerification.summaryHeading).toBe(true);
+  expect(safe.orderSummaryVerification.summaryFormPresent).toBe(true);
+  expect(safe.orderSummaryVerification.expectedFields.customerName).toBe(true);
+  expect(safe.orderSummaryVerification.expectedFields.monthlyPrice).toBe(true);
+
+  expect(serialized).not.toContain('PRIVATE_CUSTOMER_SENTINEL');
+  expect(serialized).not.toContain('PRIVATE_BODY_SENTINEL');
+  expect(serialized).not.toContain('PRIVATE_TOKEN');
+});
+test('route response sanitizer preserves only the exact Order Summary route', () => {
+  const safe = sanitizeExecutionReport({
+    routeResponses: [
+      {
+        path: '/allconnect-frame/order-summary',
+        status: 200
+      },
+      {
+        path: '/private/customer-details',
+        status: 302
+      },
+      {
+        path: '/allconnect-frame/order-summary?token=PRIVATE_TOKEN',
+        status: 200
+      }
+    ]
+  });
+
+  expect(safe.routeResponses[0]).toEqual({
+    path: '/allconnect-frame/order-summary',
+    status: 200
+  });
+
+  expect(safe.routeResponses[1]).toEqual({
+    path: '[redacted]',
+    status: 302
+  });
+
+  expect(safe.routeResponses[2].path).toBe('[redacted]');
+
+  expect(JSON.stringify(safe)).not.toContain('PRIVATE_TOKEN');
+});
