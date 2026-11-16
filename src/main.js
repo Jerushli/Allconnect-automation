@@ -2520,11 +2520,40 @@ const controls = Array.from(
         bodyDataset[key] = value;
       }
     }
-
-    const javascriptResourceCount = performance
+    const javascriptResourceEntries = performance
       .getEntriesByType('resource')
-      .filter(entry => /\.(m?js)(\?|$)/i.test(entry.name))
-      .length;
+      .filter(entry => /\.(m?js)(\?|$)/i.test(entry.name));
+
+    const javascriptResources = javascriptResourceEntries
+      .slice(0, 50)
+      .map(entry => {
+        try {
+          const resourceUrl = new URL(
+            entry.name,
+            document.location.href
+          );
+
+          const filename = resourceUrl.pathname
+            .split('/')
+            .pop() || '';
+
+          const safeFilename =
+            /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.m?js$/i.test(filename)
+              ? filename.replace(/\d{7,}/g, '[id]')
+              : '[redacted]';
+
+          return {
+            sameOrigin:
+              resourceUrl.origin === document.location.origin,
+            filename: safeFilename
+          };
+        } catch {
+          return {
+            sameOrigin: false,
+            filename: '[unavailable]'
+          };
+        }
+      });
 
     return {
       url: safeUrl(document.location.href),
@@ -2538,7 +2567,8 @@ const controls = Array.from(
 
       headings,
       relevantMessages,
-      javascriptResourceCount,
+      javascriptResourceCount: javascriptResources.length,
+      javascriptResources,
 
       renderState: {
         readyState: document.readyState,
