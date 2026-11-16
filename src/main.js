@@ -85,6 +85,7 @@ function sanitizeExecutionReport(report) {
   'formMethod',
   'formNoValidate',
   'onclickPresent',
+  'inlineOnclickPresent',
   'checked',
   'ariaInvalid',
   'valid'
@@ -2953,6 +2954,24 @@ if (input.installation.type === 'professional_installation') {
 
   console.log('[VERIFIED] Installation date and preferred time selected.');
   }
+    // READ-ONLY DIAGNOSTIC: Inspect checkout controls before the safety stop.
+  // This does not click buttons or submit forms.
+  result.navigationInspection = await inspectCheckoutNavigation(checkoutFrame);
+
+  const installationControl =
+    result.navigationInspection.controls.find(
+      control => control.text === 'Confirm Installation >'
+    );
+
+  console.log('\nCONFIRM INSTALLATION READ-ONLY INSPECTION:');
+  console.log(JSON.stringify(
+    installationControl || {
+      found: false,
+      reason: 'Visible Confirm Installation control was not found.'
+    },
+    null,
+    2
+  ));
   // SAFETY STOP: Do not confirm installation until the portal action
   // and its resulting state have been independently verified.
   console.log(

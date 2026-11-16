@@ -51,14 +51,35 @@ test('demo checkout stops before Confirm Installation and Forward', async ({ pag
     }
   });
 
+  // Installation selection must be verified.
   expect(result.installation.verified).toBe(true);
+
+  // Confirm Installation must not be clicked or confirmed.
   expect(result.installation.confirmationClicked).toBe(false);
   expect(result.installation.confirmed).toBe(false);
 
+  // The workflow must stop safely.
   expect(result.stoppedSafely).toBe(true);
   expect(result.orderSummaryReached).toBe(false);
   expect(result.finalOrderSubmitted).toBe(false);
 
+  // Read-only navigation inspection must be captured.
+  expect(result.navigationInspection).toBeTruthy();
+
+  const confirmControl = result.navigationInspection.controls.find(
+    control => control.text === 'Confirm Installation >'
+  );
+
+  expect(confirmControl).toBeTruthy();
+  expect(confirmControl.tag).toBe('BUTTON');
+  expect(confirmControl.type).toBe('button');
+  expect(confirmControl.disabled).toBe(false);
+  expect(confirmControl.insideForm).toBe(false);
+  expect(confirmControl.formDetails).toBeNull();
+  expect(confirmControl.formActionPresent).toBe(false);
+  expect(confirmControl.inlineOnclickPresent).toBe(false);
+
+  // Neither button may have been clicked.
   expect(await page.evaluate(() => window.__confirmClickCount)).toBe(0);
   expect(await page.evaluate(() => window.__forwardClickCount)).toBe(0);
 });

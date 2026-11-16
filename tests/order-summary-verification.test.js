@@ -354,6 +354,7 @@ test('sanitizer preserves safe form inspection metadata', () => {
   expect(details.inlineOnsubmitPresent).toBe(true);
   expect(details.submitControlCount).toBe(1);
 });
+
 test('sanitizer preserves safe button submission metadata', () => {
   const safe = sanitizeExecutionReport({
     navigationInspection: {
@@ -362,7 +363,8 @@ test('sanitizer preserves safe button submission metadata', () => {
         type: 'submit',
         text: 'Confirm Installation >',
         formMethod: 'POST',
-        formNoValidate: true
+        formNoValidate: true,
+        inlineOnclickPresent: true
       }]
     }
   });
@@ -372,4 +374,5 @@ test('sanitizer preserves safe button submission metadata', () => {
   expect(control.type).toBe('submit');
   expect(control.formMethod).toBe('POST');
   expect(control.formNoValidate).toBe(true);
+  expect(control.inlineOnclickPresent).toBe(true);
 });
