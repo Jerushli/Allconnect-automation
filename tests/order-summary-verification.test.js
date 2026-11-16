@@ -320,3 +320,56 @@ test('route response sanitizer preserves only the exact Order Summary route', ()
 
   expect(JSON.stringify(safe)).not.toContain('PRIVATE_TOKEN');
 });
+test('sanitizer preserves safe form inspection metadata', () => {
+  const safe = sanitizeExecutionReport({
+    navigationInspection: {
+      controls: [
+        {
+          tag: 'BUTTON',
+          type: 'button',
+          text: 'Confirm Installation >',
+          formDetails: {
+            present: true,
+            idPresent: true,
+            actionPresent: true,
+            action: 'https://portal.test/allconnect-frame/installation-payment/',
+            method: 'POST',
+            enctype: 'application/x-www-form-urlencoded',
+            target: '_self',
+            inlineOnsubmitPresent: true,
+            submitControlCount: 1
+          }
+        }
+      ]
+    }
+  });
+
+  const details =
+    safe.navigationInspection.controls[0].formDetails;
+
+  expect(details.present).toBe(true);
+  expect(details.actionPresent).toBe(true);
+  expect(details.method).toBe('POST');
+  expect(details.target).toBe('_self');
+  expect(details.inlineOnsubmitPresent).toBe(true);
+  expect(details.submitControlCount).toBe(1);
+});
+test('sanitizer preserves safe button submission metadata', () => {
+  const safe = sanitizeExecutionReport({
+    navigationInspection: {
+      controls: [{
+        tag: 'BUTTON',
+        type: 'submit',
+        text: 'Confirm Installation >',
+        formMethod: 'POST',
+        formNoValidate: true
+      }]
+    }
+  });
+
+  const control = safe.navigationInspection.controls[0];
+
+  expect(control.type).toBe('submit');
+  expect(control.formMethod).toBe('POST');
+  expect(control.formNoValidate).toBe(true);
+});

@@ -73,7 +73,22 @@ function sanitizeExecutionReport(report) {
   }));
 }
       if (key === 'controls') {
-        const allowed = new Set(['tag', 'type', 'text', 'disabled', 'required', 'insideForm', 'formActionPresent', 'formMethod', 'onclickPresent', 'checked', 'ariaInvalid', 'valid']);
+        const allowed = new Set([
+  'tag',
+  'type',
+  'text',
+  'disabled',
+  'required',
+  'insideForm',
+  'formDetails',
+  'formActionPresent',
+  'formMethod',
+  'formNoValidate',
+  'onclickPresent',
+  'checked',
+  'ariaInvalid',
+  'valid'
+]);
         return value.map(control => Object.fromEntries(Object.entries(control || {})
           .filter(([field]) => allowed.has(field))
           .map(([field, fieldValue]) => [field, visit(fieldValue, field)])));
@@ -2360,78 +2375,97 @@ async function inspectCheckoutNavigation(checkoutFrame) {
         rect.height > 0;
     };
 
-    const getFormDetails = form => {
-      if (!form) return null;
 
-      const submitControls = Array.from(form.querySelectorAll(
-        'button, input[type="submit"], input[type="image"]'
-      ));
+const getFormDetails = form => {
+  if (!form) return null;
 
-      return {
-        present: true,
-        idPresent: Boolean(form.id),
-        actionPresent: Boolean(form.getAttribute('action')),
-        action: safeUrl(form.action),
-        method: (form.getAttribute('method') || 'get').toUpperCase(),
-        enctype: form.enctype || '',
-        target: ['_self', '_blank', '_parent', '_top'].includes(
-          form.getAttribute('target')
-        ) ? form.getAttribute('target') : '[redacted]',
-        inlineOnsubmitPresent: Boolean(form.getAttribute('onsubmit')),
-        submitControlCount: submitControls.length
-      };
+  const submitControls = Array.from(
+    form.querySelectorAll(
+      'button, input[type="submit"], input[type="image"]'
+    )
+  );
+
+  return {
+    present: true,
+    idPresent: Boolean(form.id),
+    actionPresent: Boolean(form.getAttribute('action')),
+    action: safeUrl(form.action),
+    method: (form.getAttribute('method') || 'get').toUpperCase(),
+    enctype: form.enctype || '',
+    target: ['_self', '_blank', '_parent', '_top'].includes(
+      form.getAttribute('target')
+    )
+      ? form.getAttribute('target')
+      : '[redacted]',
+    inlineOnsubmitPresent: Boolean(
+      form.getAttribute('onsubmit')
+    ),
+    submitControlCount: submitControls.length
+  };
+};
+
+const controls = Array.from(
+  document.querySelectorAll(
+    'button, input:not([type="hidden"]), select, textarea, a'
+  )
+)
+  .filter(isVisible)
+  .map(element => {
+    const candidate =
+      element.tagName === 'BUTTON' ||
+      (
+        element.tagName === 'INPUT' &&
+        ['button', 'submit', 'reset'].includes(element.type)
+      )
+        ? (element.innerText || element.value || '').trim()
+        : '';
+
+    const allowedActions = [
+      'Forward >',
+      'Forward',
+      'Run Credit Check',
+      'Confirm Installation >'
+    ];
+
+    const form = element.form || null;
+    const formAction = element.getAttribute('formaction');
+    const formMethod = element.getAttribute('formmethod');
+
+    return {
+      tag: element.tagName,
+      type: element.getAttribute('type'),
+      text: allowedActions.includes(candidate) ? candidate : '',
+      disabled: Boolean(element.disabled),
+      required: Boolean(element.required),
+
+      insideForm: Boolean(form),
+      formDetails: getFormDetails(form),
+
+      formActionPresent: Boolean(formAction),
+      formAction: formAction ? safeUrl(formAction) : null,
+      formMethod: formMethod
+        ? formMethod.toUpperCase()
+        : null,
+
+      formNoValidate: Boolean(element.formNoValidate),
+
+      inlineOnclickPresent: Boolean(
+        element.getAttribute('onclick')
+      ),
+
+      checked: typeof element.checked === 'boolean'
+        ? element.checked
+        : undefined,
+
+      ariaInvalid:
+        element.getAttribute('aria-invalid') === 'true',
+
+      valid: typeof element.checkValidity === 'function'
+        ? element.checkValidity()
+        : undefined
     };
+  });
 
-    const controls = Array.from(document.querySelectorAll(
-      'button, input:not([type="hidden"]), select, textarea, a'
-    ))
-      .filter(isVisible)
-      .map(element => {
-        const candidate =
-          element.tagName === 'BUTTON' ||
-          (
-            element.tagName === 'INPUT' &&
-            ['button', 'submit', 'reset'].includes(element.type)
-          )
-            ? (element.innerText || element.value || '').trim()
-            : '';
-
-        const allowedActions = [
-          'Forward >',
-          'Forward',
-          'Run Credit Check',
-          'Confirm Installation >'
-        ];
-
-        const form = element.form || null;
-        const formAction = element.getAttribute('formaction');
-
-        return {
-          tag: element.tagName,
-          type: element.getAttribute('type'),
-          text: allowedActions.includes(candidate) ? candidate : '',
-          disabled: Boolean(element.disabled),
-          required: Boolean(element.required),
-
-          insideForm: Boolean(form),
-          formDetails: getFormDetails(form),
-
-          formActionPresent: Boolean(formAction),
-          formAction: formAction ? safeUrl(formAction) : null,
-
-          onclickPresent: Boolean(element.getAttribute('onclick')),
-
-          checked: typeof element.checked === 'boolean'
-            ? element.checked
-            : undefined,
-
-          ariaInvalid: element.getAttribute('aria-invalid') === 'true',
-
-          valid: typeof element.checkValidity === 'function'
-            ? element.checkValidity()
-            : undefined
-        };
-      });
 
     const forms = {
       count: document.forms.length
