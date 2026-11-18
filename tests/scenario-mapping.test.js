@@ -12,6 +12,9 @@ const {
 
 const { validateInput } = require('../src/main');
 
+// Enable the demo-submit feature only inside this isolated test process.
+process.env.ALLOW_DEMO_ORDER_SUBMISSION = 'true';
+
 const scenarioFiles = listScenarioFiles();
 
 test('scenario runner lists the six checked-in scenario files in numeric order', () => {
@@ -42,10 +45,14 @@ for (const fileName of scenarioFiles) {
     expect(input.checkout.equipment).toBe(order.checkout.equipment);
     expect(input.checkout.nowTv).toBe(order.checkout.nowTv);
     expect(input.installation.type).toBe(order.installation.type);
-
-    if (order.identity) {
-      expect(input.identity).toEqual(order.identity);
+    if (fileName === 'scenario-04-ez-enroll.json') {
+      expect(input.paymentOptions.cardType).toBe(order.paymentOptions.cardType);
+      expect(input.paymentOptions.billingAddressSameAsService).toBe(order.paymentOptions.billingAddressSameAsService);
+      expect(input.execution.submitDemoOrder).toBe(true);
     }
+
+    expect(input).not.toHaveProperty('sensitiveData');
+    expect(input).not.toHaveProperty('identity.ssnRecordId');
   });
 
   test(`${fileName} runner executes only the selected scenario`, async () => {
@@ -127,4 +134,14 @@ test('scenario runner reports unknown when automation report omits status', asyn
   expect(progress.join('\n')).toContain(
     'Scenario result: scenario-04-ez-enroll.json unknown'
   );
+});
+
+
+test('all six scenarios expose the expected sensitive-input branch', () => {
+  for (const fileName of scenarioFiles) {
+    const order = loadScenario(fileName);
+    const input = mapLocalScenarioToAutomationInput(order);
+    expect(typeof input.accountHolder.ezEnroll).toBe('boolean');
+    expect(input).not.toHaveProperty('sensitiveData');
+  }
 });

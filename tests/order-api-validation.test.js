@@ -62,8 +62,24 @@ test('rejects final order submission', () => {
   order.execution.stopBeforeFinalOrderSubmission = false;
 
   expect(() => mapOrderToAutomationInput(order)).toThrow(
-    'Only demo orders with final submission disabled are accepted.'
+    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
   );
+});
+
+
+test('demo final submission requires a separate local environment opt-in', () => {
+  const scenario = JSON.parse(JSON.stringify(require('../test-data/scenarios/scenario-04-ez-enroll.json')));
+  const input = mapOrderToAutomationInput(scenario);
+  const previous = process.env.ALLOW_DEMO_ORDER_SUBMISSION;
+  delete process.env.ALLOW_DEMO_ORDER_SUBMISSION;
+  try {
+    expect(() => validateInput(input)).toThrow(
+      'Demo final submission is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.'
+    );
+  } finally {
+    if (previous === undefined) delete process.env.ALLOW_DEMO_ORDER_SUBMISSION;
+    else process.env.ALLOW_DEMO_ORDER_SUBMISSION = previous;
+  }
 });
 
 test('rejects non-demo execution mode', () => {
@@ -71,7 +87,7 @@ test('rejects non-demo execution mode', () => {
   order.execution.mode = 'production';
 
   expect(() => mapOrderToAutomationInput(order)).toThrow(
-    'Only demo orders with final submission disabled are accepted.'
+    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
   );
 });
 
@@ -83,3 +99,4 @@ test('rejects missing order sections', () => {
     'Missing or invalid order section: customer'
   );
 });
+

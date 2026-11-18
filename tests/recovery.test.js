@@ -96,6 +96,14 @@ test('failure classifier distinguishes validation, locator, auth, and browser fa
   expect(
     classifyError(new Error('Unexpected page transition')).type
   ).toBe('unexpected_transition');
+
+  expect(
+    classifyError(Object.assign(new Error('Use a supported synthetic test card number.'), { code: 'TEST_CARD_UNSUPPORTED' })).type
+  ).toBe('input_validation');
+
+  expect(
+    classifyError(Object.assign(new Error('DOB is not a valid calendar date.'), { code: 'DOB_DATE_INVALID' })).type
+  ).toBe('input_validation');
 });
 
 
