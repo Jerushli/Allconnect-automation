@@ -85,14 +85,49 @@ function isSafeCreditCheckStage(value) {
   return typeof value === 'string' && SAFE_CREDIT_CHECK_STAGES.has(value);
 }
 
+const SAFE_FIELD_LABELS = new Set([
+  'Name Prefix', 'First Name', 'Last Name', 'ZIP Code', 'Service Address',
+  'Unit Number', 'City', 'State', 'Service Address Type', 'Unit Type',
+  'Rent or Own', 'Customer Moving Option', 'Moving Date', 'Call ID',
+  'Contact Phone', 'Email Address', 'SSN', 'Date of Birth', 'Install Date',
+  'Preferred Time', 'Card Type', 'Card Number', 'Card Holder Name',
+  'CVV Code', 'Expiration Month', 'Expiration Year'
+]);
+
+const SAFE_FIELD_FAILURE_MESSAGES = new Set([
+  'The ZIP Code format is invalid.',
+  'The ZIP Code is required.',
+  'The portal marked the ZIP Code as invalid or unsupported.',
+  'The portal did not enable the address fields after ZIP Code entry. Verify that the ZIP Code is accepted by the portal.'
+]);
+
+function sanitizeFieldFailure(details) {
+  if (!details || details.type !== 'field_validation') return undefined;
+  const step = isSafeWorkflowStep(details.step) ? details.step : undefined;
+  const field = SAFE_FIELD_LABELS.has(details.field) ? details.field : undefined;
+  const message = SAFE_FIELD_FAILURE_MESSAGES.has(details.message)
+    ? details.message
+    : typeof details.message === 'string' && /^Could not (enter|select) (Name Prefix|First Name|Last Name|ZIP Code|Service Address|Unit Number|City|State|Service Address Type|Unit Type|Rent or Own|Customer Moving Option|Moving Date|Call ID|Contact Phone|Email Address|SSN|Date of Birth|Install Date|Preferred Time|Card Type|Card Number|Card Holder Name|CVV Code|Expiration Month|Expiration Year)\. Check that the (field is available and accepts the supplied input|requested option is available)\.$/.test(details.message)
+      ? details.message
+      : field && details.message === `The entered ${field} could not be verified.`
+        ? details.message
+        : undefined;
+  if (!step || !field || !message) return undefined;
+  return { type: 'field_validation', step, field, message };
+}
+
 
 function classifyError(error, context = {}) {
   const message = String(error?.message || error || 'Unknown error');
   const text = `${String(error?.name || 'Error')} ${message}`.toLowerCase();
   let type = 'automation';
+  const fieldFailure = sanitizeFieldFailure(error?.failureDetails);
+  if (fieldFailure) type = 'form_validation';
 
   if (/unauthorized|authentication|password missing|401|forbidden/.test(text)) {
     type = 'authentication';
+  } else if (/^(SSN_|DOB_|CVV_|EXPIRY_|TEST_CARD_|SENSITIVE_|IDENTITY_PAYLOAD_|PAYMENT_PAYLOAD_)/.test(String(error?.code || '')) || /synthetic test.card|ssn must|dob must|dob is not|cvv must|expiry must|test.card expiry|sensitive jwe payload|encrypted identity payload|encrypted payment payload/i.test(message)) {
+    type = 'input_validation';
   } else if (/form validation|validation error|please .*required|invalid .*field/.test(text)) {
     type = 'form_validation';
   } else if (/missing|required|invalid scenario|must be|unsupported value/.test(text)) {
@@ -126,11 +161,16 @@ function classifyError(error, context = {}) {
     type = 'unexpected_transition';
   }
 
+  // A verified field-level diagnostic takes precedence over broader categories
+  // such as credit_check when the failed action was a field entry.
+  if (fieldFailure) type = 'form_validation';
+
   // Do not persist raw exception text: browser/library errors can echo input values.
   return {
     type,
     recoverable: context.recoverable === true,
-    ...(isSafeWorkflowStep(context.step) ? { step: context.step } : {}),
+    ...(fieldFailure ? { fieldFailure } : {}),
+    ...(fieldFailure ? { step: fieldFailure.step } : isSafeWorkflowStep(context.step) ? { step: context.step } : {}),
     ...(isSafeCreditCheckStage(context.creditCheckStage)
       ? { creditCheckStage: context.creditCheckStage }
       : {})

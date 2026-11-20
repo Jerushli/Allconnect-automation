@@ -3,11 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node src/main.js",
+    "start": "node src/scenarioRunner.js",
     "test": "playwright test",
     "inspect": "playwright codegen",
     "api": "node src/server.js",
-    "scenario": "node src/scenarioRunner.js"
+    "scenario": "node src/scenarioRunner.js",
+    "keys:generate": "node scripts/generate-jwe-keys.js",
+    "test:jwe": "node scripts/test-jwe.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.0",

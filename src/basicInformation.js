@@ -1,6 +1,39 @@
 
 const { captureRedactedScreenshot } = require('./diagnostics');
 
+const FIELD_DELAY_MS = 2000;
+
+function createFieldError(field, reason, cause) {
+  const error = new Error(reason);
+  error.code = 'FORM_FIELD_ACTION_FAILED';
+  error.failureDetails = {
+    type: 'field_validation',
+    step: 'Basic Information',
+    field,
+    message: reason
+  };
+  if (cause) error.name = 'FieldActionError';
+  return error;
+}
+
+async function fillField(locator, value, field) {
+  try {
+    await locator.fill(value);
+    await new Promise(resolve => setTimeout(resolve, FIELD_DELAY_MS));
+  } catch (cause) {
+    throw createFieldError(field, `Could not enter ${field}. Check that the field is available and accepts the supplied input.`, cause);
+  }
+}
+
+async function selectField(locator, value, field) {
+  try {
+    await locator.selectOption(value);
+    await new Promise(resolve => setTimeout(resolve, FIELD_DELAY_MS));
+  } catch (cause) {
+    throw createFieldError(field, `Could not select ${field}. Check that the requested option is available.`, cause);
+  }
+}
+
 async function inspectBasicInformation(page) {
   if (process.env.AUTOMATION_DIAGNOSTICS !== 'true') return;
   console.log('\n--- BASIC INFORMATION PAGE ---');
@@ -66,9 +99,7 @@ async function fillMovingDate(page, moveInDate) {
   console.log('\n--- MOVING DATE HANDLING ---');
 
   if (!moveInDate) {
-    throw new Error(
-      'Moving date is required when the customer moving option is Yes.'
-    );
+    throw createFieldError('Moving Date', 'Could not enter Moving Date. Check that the field is available and accepts the supplied input.');
   }
 
   const dateFieldCandidates = [
@@ -103,9 +134,7 @@ async function fillMovingDate(page, moveInDate) {
   }
 
   if (!dateField) {
-    throw new Error(
-      'Moving date field was not found. Inspect the Basic Information page to identify its actual selector.'
-    );
+    throw createFieldError('Moving Date', 'Could not enter Moving Date. Check that the field is available and accepts the supplied input.');
   }
 
   await dateField.waitFor({
@@ -124,14 +153,12 @@ async function fillMovingDate(page, moveInDate) {
     dateForField = `${year}-${month}-${day}`;
   }
 
-  await dateField.fill(dateForField);
+  await fillField(dateField, dateForField, 'Moving Date');
 
   const actualDate = await dateField.inputValue();
 
   if (actualDate !== dateForField) {
-    throw new Error(
-      'Moving date verification failed.'
-    );
+    throw createFieldError('Moving Date', 'The entered Moving Date could not be verified.');
   }
 
   await dateField.evaluate(field => field.blur());
@@ -144,46 +171,80 @@ async function fillBasicInformation(page, customer) {
   console.log('\n--- FILLING BASIC INFORMATION ---');
 
   // 1. Select customer prefix
-  await page.locator('#namePrefixList').selectOption(customer.prefix);
+  await selectField(page.locator('#namePrefixList'), customer.prefix, 'Name Prefix');
 
   // 2. Fill customer name
-  await page.locator('#firstName').fill(customer.firstName);
-  await page.locator('#lastName').fill(customer.lastName);
+  await fillField(page.locator('#firstName'), customer.firstName, 'First Name');
+  await fillField(page.locator('#lastName'), customer.lastName, 'Last Name');
 
   console.log('Customer name filled.');
 
   // 3. Enter ZIP code to activate address fields
-  await page.locator('#ssZipCode').fill(customer.zipCode);
+  const zipField = page.locator('#ssZipCode');
+  await fillField(zipField, customer.zipCode, 'ZIP Code');
+
+  const zipIssue = await zipField.evaluate(element => {
+    const validity = element.validity;
+    if (validity && !validity.valid) {
+      if (validity.valueMissing) return 'required';
+      if (validity.patternMismatch || validity.typeMismatch || validity.badInput) return 'format';
+      return 'invalid';
+    }
+    if (element.getAttribute('aria-invalid') === 'true') return 'invalid';
+    let node = element;
+    for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) {
+      const messages = Array.from(node.querySelectorAll('[role="alert"], .error, .invalid-feedback, .field-error, .validation-error, .help-block, .alert-danger, .text-danger, [class*="error"], [class*="invalid"]'))
+        .filter(message => message.getClientRects().length)
+        .map(message => (message.textContent || '').toLowerCase());
+      if (messages.some(message => /zip|postal/.test(message) && /invalid|incorrect|unsupported|not found|not serviceable|required|enter|valid/.test(message))) return 'portal_rejected';
+    }
+    return null;
+  }).catch(() => null);
+  if (zipIssue) {
+    const reason = zipIssue === 'format'
+      ? 'The ZIP Code format is invalid.'
+      : zipIssue === 'required'
+        ? 'The ZIP Code is required.'
+        : 'The portal marked the ZIP Code as invalid or unsupported.';
+    throw createFieldError('ZIP Code', reason);
+  }
 
   console.log('ZIP Code entered. Waiting for address fields...');
 
   // 4. Wait until the portal enables the address field
   const addressField = page.locator('#address1');
 
-  await addressField.waitFor({
-    state: 'visible',
-    timeout: 15000
-  });
+  try {
+    await addressField.waitFor({
+      state: 'visible',
+      timeout: 15000
+    });
 
-  await page.waitForFunction(() => {
-    const field = document.querySelector('#address1');
-    return field && !field.disabled;
-  }, { timeout: 20000 });
+    await page.waitForFunction(() => {
+      const field = document.querySelector('#address1');
+      return field && !field.disabled;
+    }, { timeout: 20000 });
+  } catch (cause) {
+    throw createFieldError(
+      'ZIP Code',
+      'The portal did not enable the address fields after ZIP Code entry. Verify that the ZIP Code is accepted by the portal.',
+      cause
+    );
+  }
 
   console.log('Address field is enabled.');
 
   // 5. Fill address details
-  await addressField.fill(customer.address);
-  await page.locator('#unitNumber').fill(customer.unitNumber);
-  await page.locator('#city').fill(customer.city);
+  await fillField(addressField, customer.address, 'Service Address');
+  await fillField(page.locator('#unitNumber'), customer.unitNumber, 'Unit Number');
+  await fillField(page.locator('#city'), customer.city, 'City');
 
   console.log('Address details filled.');
 
   // 6. Select state and dwelling details
-  await page.locator('#stateList').selectOption(customer.state);
+  await selectField(page.locator('#stateList'), customer.state, 'State');
 
-  await page.locator('#serviceAddressTypeList')
-    .selectOption(customer.serviceAddressType);
+  await selectField(page.locator('#serviceAddressTypeList'), customer.serviceAddressType, 'Service Address Type');
 
   const unitTypeField = page.locator('#unitTypeList');
 
@@ -197,9 +258,9 @@ async function fillBasicInformation(page, customer) {
     return field && !field.disabled;
   }, { timeout: 20000 });
 
-  await unitTypeField.selectOption(customer.unitType);
+  await selectField(unitTypeField, customer.unitType, 'Unit Type');
 
-  await page.locator('#rentOwnList').selectOption(customer.rentOwn);
+  await selectField(page.locator('#rentOwnList'), customer.rentOwn, 'Rent or Own');
 
   // 7. Select customer moving option
   const customerMoveField = page.locator('#customerMove');
@@ -209,7 +270,7 @@ async function fillBasicInformation(page, customer) {
     timeout: 10000
   });
 
-  await customerMoveField.selectOption(customer.customerMove);
+  await selectField(customerMoveField, customer.customerMove, 'Customer Moving Option');
 
   console.log('Customer moving option selected:', customer.customerMove);
 
@@ -232,7 +293,7 @@ async function fillBasicInformation(page, customer) {
   // 9. Fill call ID
   const callIdField = page.locator('#rvCallID');
 
-  await callIdField.fill(customer.callId);
+  await fillField(callIdField, customer.callId, 'Call ID');
 
   console.log('Call ID entered.');
 
@@ -255,9 +316,17 @@ async function fillBasicInformation(page, customer) {
     const actual = await page.locator(selector).inputValue();
 
     if (actual !== expected) {
-      throw new Error(
-        `Verification failed for customer field ${selector}.`
-      );
+      const fieldNames = {
+        '#firstName': 'First Name',
+        '#lastName': 'Last Name',
+        '#ssZipCode': 'ZIP Code',
+        '#address1': 'Service Address',
+        '#unitNumber': 'Unit Number',
+        '#city': 'City',
+        '#rvCallID': 'Call ID'
+      };
+      const fieldName = fieldNames[selector] || 'Customer Field';
+      throw createFieldError(fieldName, `The entered ${fieldName} could not be verified.`);
     }
   }
 
@@ -277,9 +346,16 @@ async function fillBasicInformation(page, customer) {
     const actual = await page.locator(selector).inputValue();
 
     if (actual !== expected) {
-      throw new Error(
-        `Dropdown verification failed for ${selector}.`
-      );
+      const fieldNames = {
+        '#namePrefixList': 'Name Prefix',
+        '#unitTypeList': 'Unit Type',
+        '#stateList': 'State',
+        '#serviceAddressTypeList': 'Service Address Type',
+        '#rentOwnList': 'Rent or Own',
+        '#customerMove': 'Customer Moving Option'
+      };
+      const fieldName = fieldNames[selector] || 'Customer Field';
+      throw createFieldError(fieldName, `Could not select ${fieldName}. Check that the requested option is available.`);
     }
   }
 

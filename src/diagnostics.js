@@ -22,6 +22,8 @@ function redactDiagnosticText(value) {
     .replace(/\b\d{4}-\d{2}-\d{2}\b/g, '[REDACTED]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[REDACTED]')
     .replace(/\b(?:\+?\d[\d .()/-]{7,}\d)\b/g, '[REDACTED]')
+    .replace(/\b(?:\d[ -]?){13,19}\b/g, '[REDACTED]')
+    .replace(/\b(card\s*number|cvv|cvc|security\s*code)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
     .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
     .replace(/\b(password|token|secret|authorization)\s*[:=]\s*\S+/gi, '$1=[REDACTED]');
 }

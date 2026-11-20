@@ -11,7 +11,7 @@
     "state": "NY",
     "residenceType": "Apartment",
     "ownership": "Rent",
-    "leadId": "",
+    "leadId": "1111111111",
     "moving": "No",
     "moveInDate": "",
     "prefix": "Mr",
@@ -40,8 +40,9 @@
     "shippingAddressSameAsService": true
   },
   "execution": {
-    "mode": "demo",
-    "stopBeforeFinalOrderSubmission": true
+  "mode": "demo",
+  "stopBeforeFinalOrderSubmission": false,
+  "submitDemoOrder": true
   },
   "checkout": {
     "broadbandFactLabels": "not_requested",

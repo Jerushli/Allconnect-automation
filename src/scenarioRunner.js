@@ -6,6 +6,11 @@ const readline = require('readline');
 const { runAutomation, validateInput } = require('./main');
 const { mapOrderToAutomationInput } = require('./orderMapper');
 const { classifyError } = require('./recovery');
+const { createApp } = require('./server');
+const { ensureServerKeyPair } = require('./keyManagement');
+const { encryptJwe, decryptJwe } = require('./encryption');
+const { promptSensitivePayload, validateSensitivePayload, zeroSensitivePayload } = require('./sensitiveInput');
+const crypto = require('crypto');
 
 const scenarioDirectory = path.join(
   __dirname,
@@ -44,60 +49,80 @@ function mapLocalScenarioToAutomationInput(order) {
   if (!order || typeof order !== 'object' || Array.isArray(order)) {
     throw new Error('Scenario must be a JSON object.');
   }
-
-  if (Object.prototype.hasOwnProperty.call(order, 'payment')) {
-    throw new Error('Payment data is not accepted in local scenarios.');
+  if (Object.prototype.hasOwnProperty.call(order, 'identity') || Object.prototype.hasOwnProperty.call(order, 'payment')) {
+    throw new Error('Sensitive identity and payment values must be entered at runtime, not stored in scenario JSON.');
   }
+  return mapOrderToAutomationInput(order);
+}
 
-  let identity = null;
+async function postEncryptedScenario(order, options = {}) {
+  const keys = options.jweKeys || ensureServerKeyPair();
+  const apiToken = crypto.randomBytes(32).toString('hex');
+  const app = createApp({
+    apiToken,
+    jweKeys: keys,
+    runAutomation: options.runAutomation || runAutomation,
+    requestSensitiveRefresh: async scenarioOrder => {
+      const refreshed = await promptSensitivePayload(scenarioOrder, options.log || console.log);
+      validateSensitivePayload(refreshed, scenarioOrder);
+      const refreshedJwe = encryptJwe(refreshed, keys.publicKey, keys.kid);
+      const serverSidePayload = decryptJwe(refreshedJwe, keys.privateKey, keys.kid);
+      validateSensitivePayload(serverSidePayload, scenarioOrder);
+      return serverSidePayload;
+    }
+  });
 
-  if (Object.prototype.hasOwnProperty.call(order, 'identity')) {
-    identity = order.identity;
+  const server = await new Promise((resolve, reject) => {
+    const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
+    instance.once('error', reject);
+  });
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const headers = { Authorization: `Bearer ${apiToken}` };
+  let sensitivePayload;
 
-    if (
-      !identity ||
-      typeof identity !== 'object' ||
-      Array.isArray(identity)
-    ) {
-      throw new Error('Invalid encrypted identity section.');
+  try {
+    const keyResponse = await fetch(`${baseUrl}/api/crypto/public-key`);
+    if (!keyResponse.ok) throw new Error('Could not retrieve the automation backend public key.');
+    const keyInfo = await keyResponse.json();
+    if (keyInfo.kid !== keys.kid || keyInfo.algorithm !== 'RSA-OAEP-256' || keyInfo.encryption !== 'A256GCM') {
+      throw new Error('Automation backend returned an unsupported or mismatched JWE key.');
     }
 
-    const allowedFields = [
-      'ssnRecordId',
-      'dateOfBirthRecordId'
-    ];
-
-    if (Object.keys(identity).some(key => !allowedFields.includes(key))) {
-      throw new Error(
-        'Only encrypted SSN and DOB record IDs are accepted.'
-      );
+    let response;
+    let resultBody;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      sensitivePayload = await promptSensitivePayload(order, options.log || console.log);
+      validateSensitivePayload(sensitivePayload, order);
+      const sensitiveJwe = encryptJwe(sensitivePayload, keyInfo.publicKey, keyInfo.kid);
+      response = await fetch(`${baseUrl}/api/scenarios/run`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order, sensitiveJwe })
+      });
+      resultBody = await response.json();
+      zeroSensitivePayload(sensitivePayload);
+      sensitivePayload = null;
+      if (response.status !== 428) break;
+      (options.log || console.log)('Sensitive input expired before the backend accepted it. Please enter it again.');
     }
 
-    const uuidV4 =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-    if (
-      !uuidV4.test(identity.ssnRecordId || '') ||
-      !uuidV4.test(identity.dateOfBirthRecordId || '')
-    ) {
-      throw new Error('Valid encrypted SSN and DOB record IDs are required.');
+    if (!response || !response.ok) {
+      const failureType = resultBody?.failureType || 'api';
+      const failureStage = resultBody?.failureStage || 'encrypted_api_request';
+      const failureCode = resultBody?.failureCode || 'ENCRYPTED_SCENARIO_REQUEST_FAILED';
+      const error = new Error(`Scenario request failed: ${failureType} at ${failureStage} (${failureCode}).`);
+      error.failureType = failureType;
+      error.failureStage = failureStage;
+      error.failureCode = failureCode;
+      error.runId = resultBody?.runId || null;
+      throw error;
     }
+    return resultBody;
+  } finally {
+    if (sensitivePayload) zeroSensitivePayload(sensitivePayload);
+    await new Promise(resolve => server.close(resolve));
   }
-
-  // Keep the API mapper's existing security restrictions intact.
-  const { identity: ignoredIdentity, ...safeOrder } = order;
-
-  const automationInput = mapOrderToAutomationInput(safeOrder);
-
-  // Pass only encrypted record references to the local automation.
-  if (identity) {
-    automationInput.identity = {
-      ssnRecordId: identity.ssnRecordId,
-      dateOfBirthRecordId: identity.dateOfBirthRecordId
-    };
-  }
-
-  return automationInput;
 }
 
 async function runScenarioFile(fileName, options = {}) {
@@ -105,8 +130,8 @@ async function runScenarioFile(fileName, options = {}) {
   const automationInput = mapLocalScenarioToAutomationInput(order);
   validateInput(automationInput);
 
-  const execute = options.runAutomation || runAutomation;
-  return execute(automationInput);
+  if (options.runAutomation) return options.runAutomation(automationInput);
+  return postEncryptedScenario(order, options);
 }
 
 function resolveScenarioSelection(answer, files = listScenarioFiles()) {
@@ -136,10 +161,17 @@ async function runScenarioSelection(answer, options = {}) {
   const automationInput = mapLocalScenarioToAutomationInput(order);
   validateInput(automationInput);
   log('Input validation passed.');
-  log('Starting automation...');
 
-  const execute = options.runAutomation || runAutomation;
-  const report = await execute(automationInput);
+  let report;
+  if (options.runAutomation) {
+    // Test hook: keep deterministic unit tests independent of terminal input.
+    log('Starting automation...');
+    report = await options.runAutomation(automationInput);
+  } else {
+    log('Sensitive values will be requested now and encrypted before they reach the local backend.');
+    report = await postEncryptedScenario(order, { log });
+  }
+
   log('Scenario result:', selectedFile, report.status || 'unknown');
   return { selectedFile, report, automationInput };
 }
@@ -185,7 +217,14 @@ async function main() {
     console.log('Summary:', selection.report.summary || {});
 
   } catch (error) {
-    console.error('\nScenario failed:', classifyError(error).type);
+    const failureType = error.failureType || classifyError(error).type;
+    const failureStage = error.failureStage || (failureType === 'input_validation' ? 'sensitive_input' : null);
+    const failureCode = error.failureCode || (/^[A-Z0-9_]{3,64}$/.test(String(error.code || '')) ? error.code : null);
+    console.error('\nScenario failed:', failureType);
+    if (failureStage) console.error('Failure stage:', failureStage);
+    if (failureCode) console.error('Failure code:', failureCode);
+    if (error.runId) console.error('Run ID:', error.runId);
+    if (error.failureStage === 'input_validation') console.error('A sanitized failure report was saved in the reports folder.');
     process.exitCode = 1;
   }
 }
@@ -203,5 +242,7 @@ module.exports = {
   mapLocalScenarioToAutomationInput,
   runScenarioFile,
   resolveScenarioSelection,
-  runScenarioSelection
+  runScenarioSelection,
+  postEncryptedScenario,
+  main
 };

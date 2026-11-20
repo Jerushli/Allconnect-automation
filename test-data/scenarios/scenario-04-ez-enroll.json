@@ -11,7 +11,7 @@
     "state": "NY",
     "residenceType": "Apartment",
     "ownership": "Rent",
-    "leadId": "",
+    "leadId": "1111111111",
     "moving": "No",
     "moveInDate": "",
     "prefix": "Mr",
@@ -41,7 +41,8 @@
   },
   "execution": {
     "mode": "demo",
-    "stopBeforeFinalOrderSubmission": true
+    "stopBeforeFinalOrderSubmission": false,
+    "submitDemoOrder": true
   },
   "checkout": {
     "broadbandFactLabels": "not_requested",
@@ -51,5 +52,9 @@
   },
   "installation": {
     "type": "standard_shipping"
+  },
+  "paymentOptions": {
+    "cardType": "Visa",
+    "billingAddressSameAsService": true
   }
 }

@@ -11,7 +11,7 @@
     "state": "NY",
     "residenceType": "Apartment",
     "ownership": "Rent",
-    "leadId": "",
+    "leadId": "1111111111",
     "moving": "No",
     "moveInDate": "",
     "prefix": "Mr",
@@ -38,10 +38,6 @@
     "readAcknowledgement": true,
     "mailingAddressSameAsService": true,
     "shippingAddressSameAsService": true
-  },
-  "identity": {
-    "ssnRecordId": "2ae710f5-ed54-42f1-a8ef-7be9afb4aabd",
-    "dateOfBirthRecordId": "47bc66c9-0e04-404a-b318-9f13cb08d0a2"
   },
   "execution": {
     "mode": "demo",

@@ -1,10 +1,9 @@
-
 {
   "customer": {
     "firstName": "Demo",
     "middleInitial": "",
     "lastName": "Customer",
-    "zipCode": "12207",
+    "zipCode": "12208",
     "streetAddress": "123 ple Street",
     "unitType": "Apartment",
     "unitNumber": "1",
@@ -12,7 +11,7 @@
     "state": "NY",
     "residenceType": "Apartment",
     "ownership": "Rent",
-    "leadId": "",
+    "leadId": "1111111111",
     "moving": "No",
     "moveInDate": "",
     "prefix": "Mr",
@@ -39,10 +38,6 @@
     "readAcknowledgement": true,
     "mailingAddressSameAsService": true,
     "shippingAddressSameAsService": true
-  },
-  "identity": {
-    "ssnRecordId": "4dfd7b3f-aa83-4698-a05b-e8b7cdd499d6",
-    "dateOfBirthRecordId": "192907ef-dd83-445d-a88e-4e795fd18ea3"
   },
   "execution": {
     "mode": "demo",

@@ -28,13 +28,21 @@ function mapOrderToAutomationInput(order) {
   }
 
   // Keep the API restricted to the demo workflow.
+  const submitDemoOrder = order.execution.submitDemoOrder === true;
   if (
-    order.execution.mode !== 'demo' ||
-    order.execution.stopBeforeFinalOrderSubmission !== true
-  ) {
-    throw new Error(
-      'Only demo orders with final submission disabled are accepted.'
-    );
+  order.execution.mode !== 'demo' ||
+  (order.execution.stopBeforeFinalOrderSubmission !== true && !submitDemoOrder)
+) {
+  throw new Error(
+    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
+  );
+}
+
+  if (submitDemoOrder && order.accountHolder.ezEnroll === true) {
+  const options = order.paymentOptions;
+    if (!options || !['Visa', 'MasterCard', 'American Express', 'Discover'].includes(options.cardType) || typeof options.billingAddressSameAsService !== 'boolean') {
+      throw new Error('Demo paymentOptions must specify a supported cardType and billingAddressSameAsService boolean.');
+    }
   }
 
   // Do not accept identity or payment data through this API.
@@ -128,24 +136,20 @@ function mapOrderToAutomationInput(order) {
         accountHolder.shippingAddressSameAsService
     },
 
-    // These actions remain disabled in the demo workflow.
-    identity: {
-      ssn: '',
-      dateOfBirth: ''
-    },
-
     installation: {
       type: installation.type,
       confirmInstallation: false
     },
 
-    payment: {
-      method: 'none'
-    },
+    paymentOptions: order.paymentOptions ? {
+      cardType: order.paymentOptions.cardType,
+      billingAddressSameAsService: order.paymentOptions.billingAddressSameAsService
+    } : null,
 
     execution: {
       mode: 'demo',
-      stopBeforeFinalOrderSubmission: true
+      stopBeforeFinalOrderSubmission: !submitDemoOrder,
+      submitDemoOrder
     }
   };
 }

@@ -27,6 +27,7 @@ const {
 } = require('./basicInformation');
 const diagnosticInspectionsEnabled =
   process.env.AUTOMATION_DIAGNOSTICS === 'true';
+const { validateSensitivePayload, isSensitivePayloadFresh, zeroSensitivePayload } = require('./sensitiveInput');
 const checkoutFrameCache = new WeakMap();
 const creditCheckFailureStages = new WeakMap();
 
@@ -38,11 +39,40 @@ function getCreditCheckStageForError(error) {
 }
 
 function sanitizeExecutionReport(report) {
-  const sensitiveKeys = /^(customer|customerName|contact|identity|firstName|middleInitial|lastName|fullName|phone|email|ssn|dob|dateOfBirth|password|token|apiToken|accessToken|sensitiveDataAccessToken|secret|authorization|cardNumber|cvv|address|unitNumber|city|zipCode|callId|moveInDate|installDate|orderNumber|value|valueAttribute|inputValue|fieldValue|bodyText|pageText|stack|message|requested|observed|selected|selectedOption|formAction|formId|href|autocomplete|screenshotPath|path|validationMessage)$/i;
+  const sensitiveKeys = /^(customer|customerName|contact|identity|firstName|middleInitial|lastName|fullName|phone|email|ssn|dob|dateOfBirth|password|token|apiToken|accessToken|sensitiveDataAccessToken|secret|authorization|cardNumber|cardHolderName|cardholder|cvv|expirationMonth|expirationYear|expiry|address|unitNumber|city|zipCode|callId|moveInDate|installDate|orderNumber|value|valueAttribute|inputValue|fieldValue|bodyText|pageText|stack|message|requested|observed|selected|selectedOption|formAction|formId|href|autocomplete|screenshotPath|path|validationMessage)$/i;
   const safeActionText = new Set(['Forward >', 'Forward', 'Run Credit Check', 'Confirm Installation >']);
 
   function visit(value, key = '') {
     if (key === 'step') return isSafeWorkflowStep(value) ? value : '[redacted]';
+    if (key === 'fieldFailure') {
+      const failure = value && typeof value === 'object' ? value : {};
+      const safeSteps = new Set([
+        'Basic Information', 'Account Holder Validation',
+        'Demo Credit Check, Installation and Payment'
+      ]);
+      const safeFields = new Set([
+        'Name Prefix', 'First Name', 'Last Name', 'ZIP Code', 'Service Address',
+        'Unit Number', 'City', 'State', 'Service Address Type', 'Unit Type',
+        'Rent or Own', 'Customer Moving Option', 'Moving Date', 'Call ID',
+        'Contact Phone', 'Email Address', 'SSN', 'Date of Birth', 'Install Date',
+        'Preferred Time', 'Card Type', 'Card Number', 'Card Holder Name',
+        'CVV Code', 'Expiration Month', 'Expiration Year'
+      ]);
+      const safeMessage = typeof failure.message === 'string' && (
+        /^Could not (enter|select) /.test(failure.message) ||
+        /^The entered .+ could not be verified\.$/.test(failure.message) ||
+        failure.message === 'The ZIP Code format is invalid.' ||
+        failure.message === 'The ZIP Code is required.' ||
+        failure.message === 'The portal marked the ZIP Code as invalid or unsupported.' ||
+        failure.message === 'The portal did not enable the address fields after ZIP Code entry. Verify that the ZIP Code is accepted by the portal.'
+      ) ? failure.message : 'The form field could not be completed.';
+      return {
+        type: 'field_validation',
+        ...(safeSteps.has(failure.step) ? { step: failure.step } : {}),
+        ...(safeFields.has(failure.field) ? { field: failure.field } : {}),
+        message: safeMessage
+      };
+    }
     if (key === 'creditCheckStage') {
       return isSafeCreditCheckStage(value) ? value : '[redacted]';
     }
@@ -153,7 +183,7 @@ function saveExecutionReport(report) {
 // INPUT VALIDATION
 // ============================================================
 
-function validateInput(input) {
+function validateInput(input, options = {}) {
   if (!input || typeof input !== 'object') {
     throw new Error('Automation input must be an object.');
   }
@@ -332,10 +362,30 @@ function validateInput(input) {
     throw new Error('This automation currently supports demo mode only.');
   }
 
-  if (input.execution.stopBeforeFinalOrderSubmission !== true) {
-    throw new Error(
-      'The simulator has no final-submit handler; demo automation must stop at Order Summary.'
-    );
+  const submitDemoOrder = input.execution.submitDemoOrder === true;
+  if (
+    (input.execution.stopBeforeFinalOrderSubmission !== true && !submitDemoOrder) ||
+    (submitDemoOrder && input.execution.mode !== 'demo')
+  ) {
+    throw new Error('Final submission is permitted only for an explicitly opted-in demo run.');
+  }
+
+  if (submitDemoOrder) {
+    if (process.env.ALLOW_DEMO_ORDER_SUBMISSION !== 'true') {
+      throw new Error('Demo final submission is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.');
+    }
+    // EZ-Enroll runs require synthetic card details. Credit-approved runs
+    // (ezEnroll=false) do not enter card details and proceed via authorization.
+    if (input.accountHolder.ezEnroll === true) {
+      const options = input.paymentOptions;
+      if (!options || !['Visa', 'MasterCard', 'American Express', 'Discover'].includes(options.cardType) || typeof options.billingAddressSameAsService !== 'boolean') {
+        throw new Error('EZ-Enroll paymentOptions must contain a supported cardType and billingAddressSameAsService boolean.');
+      }
+    }
+  }
+
+  if (options.requireSensitiveData === true) {
+    validateSensitivePayload(input.sensitiveData, { accountHolder: input.accountHolder });
   }
 
   console.log('Input validation completed.');
@@ -509,6 +559,45 @@ async function inspectCheckout(page) {
 
 function pause(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const FORM_FIELD_DELAY_MS = 2000;
+
+function createFieldActionError(step, field, message, cause) {
+  const error = new Error(message);
+  error.name = 'FieldActionError';
+  error.code = 'FORM_FIELD_ACTION_FAILED';
+  error.failureDetails = { type: 'field_validation', step, field, message };
+  // Do not attach the raw Playwright exception: it can contain typed values.
+  return error;
+}
+
+async function fillFieldWithDelay(locator, value, step, field) {
+  try {
+    await locator.fill(value);
+    await pause(FORM_FIELD_DELAY_MS);
+  } catch (cause) {
+    throw createFieldActionError(
+      step,
+      field,
+      `Could not enter ${field}. Check that the field is available and accepts the supplied input.`,
+      cause
+    );
+  }
+}
+
+async function selectFieldWithDelay(locator, option, step, field) {
+  try {
+    await locator.selectOption(option);
+    await pause(FORM_FIELD_DELAY_MS);
+  } catch (cause) {
+    throw createFieldActionError(
+      step,
+      field,
+      `Could not select ${field}. Check that the requested option is available.`,
+      cause
+    );
+  }
 }
 
 async function waitForManualCheck(locator, description, timeout = 120000) {
@@ -1165,14 +1254,12 @@ async function fillAccountHolderContact(checkoutFrame, input, report) {
   });
 
   // Fill phone.
-  await phoneField.fill(contact.phone.trim());
+  await fillFieldWithDelay(phoneField, contact.phone.trim(), 'Account Holder Validation', 'Contact Phone');
 
   const observedPhone = await phoneField.inputValue();
 
   if (observedPhone !== contact.phone.trim()) {
-    throw new Error(
-      'Account Holder phone number could not be verified after filling.'
-    );
+    throw createFieldActionError('Account Holder Validation', 'Contact Phone', 'The entered Contact Phone could not be verified.');
   }
 
   report.push(createReportItem({
@@ -1186,16 +1273,14 @@ async function fillAccountHolderContact(checkoutFrame, input, report) {
   console.log('[MATCHED] Account Holder phone field filled.');
 
   // Fill email.
-  await emailField.fill(contact.email.trim());
+  await fillFieldWithDelay(emailField, contact.email.trim(), 'Account Holder Validation', 'Email Address');
 
   const observedEmail = await emailField.inputValue();
 
   if (
     observedEmail.toLowerCase() !== contact.email.trim().toLowerCase()
   ) {
-    throw new Error(
-      'Account Holder email could not be verified after filling.'
-    );
+    throw createFieldActionError('Account Holder Validation', 'Email Address', 'The entered Email Address could not be verified.');
   }
 
   report.push(createReportItem({
@@ -1606,6 +1691,14 @@ for (const disclosure of requiredDisclosures) {
     .locator('.box.tinted')
     .filter({ hasText: disclosure.text });
 
+  // Selecting EZ-Enroll or Automatic Payments causes its disclosure
+  // section and Read checkbox to render dynamically. Wait for that
+  // specific section before checking its count or locating the checkbox.
+  await disclosureSection.first().waitFor({
+    state: 'visible',
+    timeout: 15000
+  });
+
   if (await disclosureSection.count() !== 1) {
     throw new Error(
       `Expected exactly one ${disclosure.name} disclosure section.`
@@ -1615,6 +1708,11 @@ for (const disclosure of requiredDisclosures) {
   const readCheckbox = disclosureSection.locator(
     'label.m-read input[type="checkbox"]'
   );
+
+  await readCheckbox.first().waitFor({
+    state: 'visible',
+    timeout: 10000
+  });
 
   if (await readCheckbox.count() !== 1) {
     throw new Error(
@@ -1682,6 +1780,98 @@ console.log(
 }
 
 // ============================================================
+// SCENARIO 3: EXISTING PROVIDER ACCOUNT POPUP
+// ============================================================
+
+async function findAddToExistingAccountAction(page) {
+  const pages = [...new Set([page, ...page.context().pages()])];
+
+  for (const candidatePage of pages) {
+    if (candidatePage.isClosed()) continue;
+
+    for (const candidateFrame of candidatePage.frames()) {
+      const controls = candidateFrame.locator(
+        'button, input[type="button"], input[type="submit"], [role="button"], a'
+      );
+
+      const matches = await controls.evaluateAll(elements => {
+        const isVisible = element => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 &&
+            rect.height > 0;
+        };
+
+        return elements.map((element, index) => {
+          const label = [
+            element.innerText,
+            element.value,
+            element.getAttribute('aria-label'),
+            element.getAttribute('title')
+          ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+
+          return {
+            index,
+            visible: isVisible(element),
+            disabled: Boolean(element.disabled),
+            matches: /add\s+to\s+existing\s+account/i.test(label)
+          };
+        }).filter(item => item.visible && !item.disabled && item.matches);
+      }).catch(() => []);
+
+      if (matches.length > 0) {
+        return {
+          locator: controls.nth(matches[0].index),
+          page: candidatePage,
+          frame: candidateFrame
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function waitForAndClickAddToExistingAccount(page, timeoutMs, phase) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const action = await findAddToExistingAccountAction(page);
+
+    if (action) {
+      console.log(
+        `[VERIFIED] Add to existing account control detected (${phase}).`
+      );
+
+      await action.locator.click({ timeout: 10000 });
+
+      const actionDismissed = await action.locator.waitFor({
+        state: 'hidden',
+        timeout: 5000
+      }).then(() => true).catch(() => false);
+
+      if (!actionDismissed &&
+          await action.locator.isVisible().catch(() => false)) {
+        throw new Error(
+          'Add to existing account was clicked but the portal dialog remained visible.'
+        );
+      }
+
+      console.log(
+        `[ACTION] Add to existing account clicked (${phase}).`
+      );
+      return true;
+    }
+
+    await page.waitForTimeout(250).catch(() => {});
+  }
+
+  return false;
+}
+
+// ============================================================
 // ADVANCE FROM ACCOUNT HOLDER TO INSTALLATION & PAYMENT
 // ============================================================
 
@@ -1727,6 +1917,23 @@ async function advanceAccountHolderToInstallation(page, report, input) {
     '\n[VERIFIED] All 10 Account Holder checks passed.'
   );
 
+  // Scenario 3 only: allow the portal's existing-account lookup to finish
+  // and inspect real interactive controls, including input[value] buttons.
+  if (input.accountHolder?.isExistingProviderCustomer === true) {
+    console.log(
+      '[WAIT] Waiting up to 5 seconds for Add to existing account before Forward...'
+    );
+
+    const handledBeforeForward =
+      await waitForAndClickAddToExistingAccount(page, 5000, 'before Forward');
+
+    if (!handledBeforeForward) {
+      console.log(
+        '[INFO] No existing-account action appeared before Forward; continuing to the portal transition.'
+      );
+    }
+  }
+
   console.log(
     '[ACTION] Clicking Account Holder Forward button...'
   );
@@ -1737,6 +1944,19 @@ await forwardButton.click({
 });
 
 console.log('[ACTION] Forward click completed.');
+
+// Some portal builds show the existing-account action only after Forward.
+// Scenario 3 gets a second bounded check before the installation transition.
+if (input.accountHolder?.isExistingProviderCustomer === true) {
+  const handledAfterForward =
+    await waitForAndClickAddToExistingAccount(page, 5000, 'after Forward');
+
+  if (!handledAfterForward) {
+    console.log(
+      '[INFO] No Add to existing account control appeared after Forward.'
+    );
+  }
+}
 
 if (page.isClosed()) {
   throw new Error(
@@ -1757,6 +1977,45 @@ if (input.accountHolder.ezEnroll === true) {
     'ORDER QUALIFICATION STATUS',
     { exact: true }
   ).waitFor({ state: 'visible', timeout: 30000 });
+} else if (input.accountHolder?.isExistingProviderCustomer === true) {
+  // Existing ProviderXX customers may be routed directly to installation
+  // after the portal attaches the order to the existing account. Do not
+  // require the separate CREDIT CHECK heading if installation controls
+  // are already present; runSimulatorCreditCheck verifies the actual form.
+  const installationOptions = updatedCheckoutFrame.locator(
+    'input[type="radio"][name="itype"]'
+  );
+  const creditHeading = updatedCheckoutFrame.getByText(
+    'CREDIT CHECK',
+    { exact: true }
+  );
+  const ssnField = updatedCheckoutFrame.getByLabel(
+    'Social Security Number',
+    { exact: true }
+  );
+
+  const transitionDeadline = Date.now() + 30000;
+  let transitionFound = false;
+
+  while (Date.now() < transitionDeadline) {
+    const headingVisible = await creditHeading.isVisible().catch(() => false);
+    const ssnVisible = await ssnField.isVisible().catch(() => false);
+    const installationVisible =
+      await installationOptions.first().isVisible().catch(() => false);
+
+    if (headingVisible || ssnVisible || installationVisible) {
+      transitionFound = true;
+      break;
+    }
+
+    await page.waitForTimeout(250);
+  }
+
+  if (!transitionFound) {
+    throw new Error(
+      'Scenario 3 did not reach a recognizable credit-check or installation state after Account Holder Forward.'
+    );
+  }
 } else {
   await updatedCheckoutFrame.getByText(
     'CREDIT CHECK',
@@ -1764,13 +2023,22 @@ if (input.accountHolder.ezEnroll === true) {
   ).waitFor({ state: 'visible', timeout: 30000 });
 }
 
-await updatedCheckoutFrame.getByText(
-  'Select Installation Type',
-  { exact: false }
-).waitFor({
-  state: 'visible',
-  timeout: 15000
-});
+if (input.accountHolder?.isExistingProviderCustomer === true) {
+  await updatedCheckoutFrame.locator(
+    'input[type="radio"][name="itype"]'
+  ).first().waitFor({
+    state: 'visible',
+    timeout: 30000
+  });
+} else {
+  await updatedCheckoutFrame.getByText(
+    'Select Installation Type',
+    { exact: false }
+  ).waitFor({
+    state: 'visible',
+    timeout: 15000
+  });
+}
 
 console.log(
   '[COMPLETED] Installation and Payment page reached.'
@@ -2069,52 +2337,41 @@ async function openInternetOffers(page, options = {}) {
 // STEP 3: INSTALLATION TYPE
 // ============================================================
 
-const sensitiveDataService = require('./sensitiveDataService');
-
-function requireRecordReference(recordId, purpose) {
-  const uuidV4 =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  if (typeof recordId !== 'string' || !uuidV4.test(recordId)) {
-    throw new Error(`A valid encrypted ${purpose.toUpperCase()} record reference is required.`);
+async function getFreshSensitiveData(input) {
+  if (isSensitivePayloadFresh(input.sensitiveData)) {
+    validateSensitivePayload(input.sensitiveData, { accountHolder: input.accountHolder });
+    return input.sensitiveData;
   }
+
+  if (typeof input.requestSensitiveRefresh !== 'function') {
+    const error = new Error('Sensitive input expired. Run the scenario again and re-enter the required details.');
+    error.code = 'SENSITIVE_INPUT_EXPIRED';
+    throw error;
+  }
+
+  console.log('[INPUT] Seven-minute sensitive-data window expired. Please re-enter the required details.');
+  zeroSensitivePayload(input.sensitiveData);
+  const refreshed = await input.requestSensitiveRefresh();
+  validateSensitivePayload(refreshed, { accountHolder: input.accountHolder });
+  input.sensitiveData = refreshed;
+  return refreshed;
 }
 
 function normalizedDateDigits(value) {
-  const date = String(value).trim();
-  const monthFirst = date.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (monthFirst) return `${monthFirst[3]}${monthFirst[1]}${monthFirst[2]}`;
-  const yearFirst = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (yearFirst) return `${yearFirst[1]}${yearFirst[2]}${yearFirst[3]}`;
-  return date.replace(/\D/g, '');
+  return String(value || '').replace(/\D/g, '');
 }
 
-async function runSimulatorCreditCheck(
-  checkoutFrame,
-  input,
-  service = sensitiveDataService,
-  accessToken = process.env.SENSITIVE_DATA_ACCESS_TOKEN
-) {
+async function runSimulatorCreditCheck(checkoutFrame, input) {
   const ezEnroll = input.accountHolder?.ezEnroll;
 
   if (ezEnroll === true) {
-    // EZ-Enroll bypasses the credit check. Confirm the portal transitioned to
-    // the installation step before continuing, without touching identity data.
-    const installationOptions = checkoutFrame.locator(
-      'input[type="radio"][name="itype"]'
-    );
-    await checkoutFrame.getByText(
-      'ORDER QUALIFICATION STATUS',
-      { exact: true }
-    ).waitFor({ state: 'visible', timeout: 15000 });
-    await installationOptions.first().waitFor({
-      state: 'visible',
-      timeout: 15000
-    });
-
+    const installationOptions = checkoutFrame.locator('input[type="radio"][name="itype"]');
+    await checkoutFrame.getByText('ORDER QUALIFICATION STATUS', { exact: true })
+      .waitFor({ state: 'visible', timeout: 15000 });
+    await installationOptions.first().waitFor({ state: 'visible', timeout: 15000 });
     if (await installationOptions.count() !== 2) {
       throw new Error('EZ-Enroll transition did not reach the installation choices.');
     }
-
     return {
       performed: false,
       approved: null,
@@ -2123,199 +2380,117 @@ async function runSimulatorCreditCheck(
     };
   }
 
-  if (ezEnroll !== false) {
-    throw new Error('EZ-Enroll must be selected before the simulator credit check.');
+  if (ezEnroll !== false) throw new Error('EZ-Enroll must be selected before the simulator credit check.');
+
+  // Existing ProviderXX customers can be routed directly to installation
+  // once the portal attaches the order to their account. Skip only when the
+  // credit form is absent AND both installation choices are actually visible.
+  if (input.accountHolder?.isExistingProviderCustomer === true) {
+    const ssnField = checkoutFrame.getByLabel(
+      'Social Security Number',
+      { exact: true }
+    );
+    const dobField = checkoutFrame.getByLabel(
+      'Date of Birth',
+      { exact: true }
+    );
+    const installationOptions = checkoutFrame.locator(
+      'input[type="radio"][name="itype"]'
+    );
+
+    const ssnVisible = await ssnField.isVisible().catch(() => false);
+    const dobVisible = await dobField.isVisible().catch(() => false);
+
+    if (!ssnVisible && !dobVisible) {
+      await installationOptions.first().waitFor({
+        state: 'visible',
+        timeout: 15000
+      });
+
+      if (await installationOptions.count() !== 2) {
+        throw new Error(
+          'Existing ProviderXX customer reached an unexpected page: credit fields are absent and installation choices are incomplete.'
+        );
+      }
+
+      console.log(
+        '[VERIFIED] Existing ProviderXX account flow does not present a credit form; installation choices are available.'
+      );
+
+      return {
+        performed: false,
+        approved: null,
+        status: 'not_required_existing_provider_account',
+        dataSource: 'portal_existing_account_flow'
+      };
+    }
   }
 
-  let creditCheckStage = 'record_preflight';
+  let creditCheckStage = 'sensitive_payload_preflight';
   try {
-  const ssnRecordId = input.identity?.ssnRecordId;
-  const dobRecordId = input.identity?.dateOfBirthRecordId;
-  requireRecordReference(ssnRecordId, 'ssn');
-  requireRecordReference(dobRecordId, 'dob');
+    let sensitiveData = await getFreshSensitiveData(input);
+    const ssnField = checkoutFrame.getByLabel('Social Security Number', { exact: true });
+    const dobField = checkoutFrame.getByLabel('Date of Birth', { exact: true });
+    await ssnField.waitFor({ state: 'visible', timeout: 15000 });
+    await dobField.waitFor({ state: 'visible', timeout: 15000 });
 
-  // Authorize both purposes before touching either record, then check both
-  // records before consuming either one. An unavailable ID may already be used.
-  creditCheckStage = 'ssn_authorization_started';
-const ssnAuthorization = service.authorizeSensitiveDataAccess(
-  accessToken,
-  'ssn'
-);
-creditCheckStage = 'ssn_authorization_completed';
-
-creditCheckStage = 'dob_authorization_started';
-const dobAuthorization = service.authorizeSensitiveDataAccess(
-  accessToken,
-  'dob'
-);
-creditCheckStage = 'dob_authorization_completed';
-
-creditCheckStage = 'ssn_record_inspection_started';
-const ssnStatus = await service.inspectSensitiveDataRecord(
-  ssnRecordId,
-  'ssn'
-);
-creditCheckStage = 'ssn_record_inspection_completed';
-
-creditCheckStage = 'dob_record_inspection_started';
-const dobStatus = await service.inspectSensitiveDataRecord(
-  dobRecordId,
-  'dob'
-);
-creditCheckStage = 'dob_record_inspection_completed';
-  creditCheckStage = 'record_availability_validation_started';
-  if (!ssnStatus.available) {
-    throw new Error('Encrypted SSN record is unavailable or already consumed. Create a fresh record before retrying.');
-  }
-  if (!dobStatus.available) {
-    throw new Error('Encrypted DOB record is unavailable or already consumed. Create a fresh record before retrying.');
-  }
-
-  const ssnField = checkoutFrame.getByLabel(
-  'Social Security Number',
-  { exact: true }
-);
-const dobField = checkoutFrame.getByLabel(
-  'Date of Birth',
-  { exact: true }
-);
-
-creditCheckStage = 'ssn_field_wait_started';
-await ssnField.waitFor({
-  state: 'visible',
-  timeout: 15000
-});
-creditCheckStage = 'ssn_field_ready';
-
-creditCheckStage = 'dob_field_wait_started';
-await dobField.waitFor({
-  state: 'visible',
-  timeout: 15000
-});
-creditCheckStage = 'dob_field_ready';
-  await service.useSensitiveData(
-    ssnRecordId,
-    'ssn',
-    ssnAuthorization,
-    async value => {
-      creditCheckStage = 'ssn_fill_started';
-await ssnField.fill(value);
-creditCheckStage = 'ssn_fill_completed';
-
-creditCheckStage = 'ssn_value_verification_started';
-
-const actualDigits = String(
-  await ssnField.inputValue()
-).replace(/\D/g, '');
-
-const suppliedDigits = String(value).replace(/\D/g, '');
-
-if (!actualDigits || actualDigits !== suppliedDigits) {
-  throw new Error(
-    'Simulator SSN field did not retain the supplied value.'
-  );
-}
-
-creditCheckStage = 'ssn_value_verified';
+    creditCheckStage = 'ssn_fill_started';
+    await fillFieldWithDelay(ssnField, sensitiveData.identity.ssn, 'Demo Credit Check, Installation and Payment', 'SSN');
+    const actualSsn = String(await ssnField.inputValue()).replace(/\D/g, '');
+    if (actualSsn !== sensitiveData.identity.ssn) {
+      throw createFieldActionError('Demo Credit Check, Installation and Payment', 'SSN', 'The entered SSN could not be verified.');
     }
-  );
-  creditCheckStage = 'ssn_fill_completed';
+    creditCheckStage = 'ssn_value_verified';
 
-  const runCreditButton = checkoutFrame.locator(
-    'input.cbtn[value="Run Credit Check"]'
-  );
-  if (await runCreditButton.count() !== 1) {
-    throw new Error('Expected exactly one simulator Run Credit Check button.');
-  }
-  await runCreditButton.waitFor({ state: 'visible', timeout: 10000 });
-  if (!(await runCreditButton.isEnabled())) {
-    throw new Error('Simulator Run Credit Check button is disabled.');
-  }
-  creditCheckStage = 'credit_button_ready';
-
-  let portalStatus = '';
-  await service.useSensitiveData(
-    dobRecordId,
-    'dob',
-    dobAuthorization,
-    async value => {
-      creditCheckStage = 'dob_fill_started';
-await dobField.fill(value);
-creditCheckStage = 'dob_fill_completed';
-
-creditCheckStage = 'dob_value_verification_started';
-
-if (
-  normalizedDateDigits(await dobField.inputValue()) !==
-  normalizedDateDigits(value)
-) {
-  throw new Error(
-    'Simulator DOB field did not retain the supplied value.'
-  );
-}
-
-creditCheckStage = 'dob_value_verified';
-creditCheckStage = 'credit_button_click_started';
-      await runCreditButton.click();
-      creditCheckStage = 'credit_button_click_completed';
-
-      const status = checkoutFrame
-  .getByText(/Credit Check Status:/i)
-  .first();
-
-creditCheckStage = 'credit_result_wait_started';
-
-await status.waitFor({
-  state: 'visible',
-  timeout: 15000
-});
-
-creditCheckStage = 'credit_result_received';
-creditCheckStage = 'credit_result_read_started';
-
-portalStatus = (await status.innerText()).trim();
-
-creditCheckStage = 'credit_result_read_completed';
+    // Check the seven-minute window again immediately before using the DOB.
+    sensitiveData = await getFreshSensitiveData(input);
+    await fillFieldWithDelay(dobField, sensitiveData.identity.dob, 'Demo Credit Check, Installation and Payment', 'Date of Birth');
+    if (normalizedDateDigits(await dobField.inputValue()) !== normalizedDateDigits(sensitiveData.identity.dob)) {
+      throw createFieldActionError('Demo Credit Check, Installation and Payment', 'Date of Birth', 'The entered Date of Birth could not be verified.');
     }
-  );
+    creditCheckStage = 'dob_value_verified';
 
-  if (!portalStatus) {
-    throw new Error('Simulator did not display a credit-check result.');
-  }
-  'credit_result_validation_started',
-  creditCheckStage = 'credit_result_validation_completed';
-  creditCheckStage = 'credit_result_validation_started';
-  const approved = /\bCredit Check Status:\s*APPROVED\b/i.test(portalStatus);
-  const safeStatus = approved
-    ? 'APPROVED'
-    : /\bCredit Check Status:\s*DECLINED\b/i.test(portalStatus)
-      ? 'DECLINED'
-      : 'UNRECOGNIZED_RESULT';
-  console.log('[VERIFIED] Simulator credit-check result:', safeStatus);
-  if (!approved) {
-    const error = new Error('Simulator credit check did not return an approval; automation stopped.');
-    error.creditCheckResult = {
-      performed: true,
-      approved: false,
-      status: safeStatus,
-      dataSource: 'encrypted-local-records'
-    };
-    throw error;
-  }
+    const runCreditButton = checkoutFrame.locator('input.cbtn[value="Run Credit Check"]');
+    if (await runCreditButton.count() !== 1) throw new Error('Expected exactly one simulator Run Credit Check button.');
+    await runCreditButton.waitFor({ state: 'visible', timeout: 10000 });
+    if (!(await runCreditButton.isEnabled())) throw new Error('Simulator Run Credit Check button is disabled.');
 
-  return {
-    performed: true,
-    approved,
-    status: safeStatus,
-    dataSource: 'encrypted-local-records'
-  };
+    sensitiveData = await getFreshSensitiveData(input);
+    // If the payload was refreshed at the last check, keep both fields in sync.
+    await fillFieldWithDelay(ssnField, sensitiveData.identity.ssn, 'Demo Credit Check, Installation and Payment', 'SSN');
+    await fillFieldWithDelay(dobField, sensitiveData.identity.dob, 'Demo Credit Check, Installation and Payment', 'Date of Birth');
+    creditCheckStage = 'credit_button_click_started';
+    await runCreditButton.click();
+    creditCheckStage = 'credit_button_click_completed';
+
+    const status = checkoutFrame.getByText(/Credit Check Status:/i).first();
+    await status.waitFor({ state: 'visible', timeout: 15000 });
+    const portalStatus = (await status.innerText()).trim();
+    if (!portalStatus) throw new Error('Simulator did not display a credit-check result.');
+
+    const approved = /\bCredit Check Status:\s*APPROVED\b/i.test(portalStatus);
+    const safeStatus = approved
+      ? 'APPROVED'
+      : /\bCredit Check Status:\s*DECLINED\b/i.test(portalStatus)
+        ? 'DECLINED'
+        : 'UNRECOGNIZED_RESULT';
+    console.log('[VERIFIED] Simulator credit-check result:', safeStatus);
+    if (!approved) {
+      const error = new Error('Simulator credit check did not return an approval; automation stopped.');
+      error.creditCheckResult = { performed: true, approved: false, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
+      throw error;
+    }
+    return { performed: true, approved: true, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
   } catch (error) {
     if (error && (typeof error === 'object' || typeof error === 'function')) {
-      // Store metadata out of band so frozen or non-extensible errors remain
-      // untouched and the original failure can always be rethrown unchanged.
       creditCheckFailureStages.set(error, creditCheckStage);
     }
     throw error;
+  } finally {
+    if (input.sensitiveData?.identity) {
+      input.sensitiveData.identity.ssn = '';
+      input.sensitiveData.identity.dob = '';
+    }
   }
 }
 
@@ -2432,9 +2607,11 @@ const controls = Array.from(
     const formAction = element.getAttribute('formaction');
     const formMethod = element.getAttribute('formmethod');
 
-    return {
+       return {
       tag: element.tagName,
       type: element.getAttribute('type'),
+      buttonId: element.id || null,
+      buttonValue: element.getAttribute('value') || null,
       text: allowedActions.includes(candidate) ? candidate : '',
       disabled: Boolean(element.disabled),
       required: Boolean(element.required),
@@ -2450,9 +2627,37 @@ const controls = Array.from(
 
       formNoValidate: Boolean(element.formNoValidate),
 
-      inlineOnclickPresent: Boolean(
+            inlineOnclickPresent: Boolean(
         element.getAttribute('onclick')
       ),
+
+      idPresent: Boolean(element.id),
+
+      classPresent: Boolean(
+        typeof element.className === 'string' &&
+        element.className.trim().length > 0
+      ),
+
+      dataAttributeNames: Array.from(element.attributes)
+        .map(attribute => attribute.name)
+        .filter(name =>
+          name.startsWith('data-') &&
+          /^[a-zA-Z0-9_-]{1,60}$/.test(name)
+        )
+        .slice(0, 20),
+
+      parentTag: element.parentElement?.tagName || null,
+
+      parentIdPresent: Boolean(
+        element.parentElement?.id
+      ),
+
+      parentFormPresent: Boolean(
+        Boolean(element.parentElement?.closest('form'))
+      ),
+
+      closestSectionTag:
+        element.closest('section, main, form')?.tagName || null,
 
       checked: typeof element.checked === 'boolean'
         ? element.checked
@@ -2567,7 +2772,7 @@ const controls = Array.from(
 
       headings,
       relevantMessages,
-      javascriptResourceCount: javascriptResources.length,
+      javascriptResourceCount: javascriptResourceEntries.length,
       javascriptResources,
 
       renderState: {
@@ -2589,13 +2794,12 @@ const controls = Array.from(
   });
 }
 
-
 async function collectOrderSummaryEvidence(checkoutFrame, input) {
   const installationOptionFee =
     input.installation.type === 'professional_installation' ? 100 : 0;
+
   const requested = {
-    customerName: `${input.customer.firstName} ${input.customer.lastName}`,
-    provider: input.plan.provider,
+    provider: String(input.plan.provider),
     monthlyPrice: Number(input.plan.monthlyPrice).toFixed(2),
     installationPrice: (
       Number(input.plan.installationPrice) + installationOptionFee
@@ -2604,92 +2808,156 @@ async function collectOrderSummaryEvidence(checkoutFrame, input) {
 
   return checkoutFrame.locator('html').evaluate((html, expected) => {
     const document = html.ownerDocument;
+
     const isVisible = element => {
+      if (!element) return false;
+
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
-      return style.display !== 'none' && style.visibility !== 'hidden' &&
-        rect.width > 0 && rect.height > 0;
-    };
-    const bodyText = document.body.innerText || '';
-    const headings = Array.from(document.querySelectorAll(
-      'h1, h2, h3, h4, h5, h6, [role="heading"]'
-    )).filter(isVisible).map(element => element.innerText.trim()).filter(Boolean);
-    const summaryForm = document.querySelector('#summaryForm');
-    const summaryFormPresent = Boolean(summaryForm && isVisible(summaryForm));
-    const summaryRoot = summaryFormPresent ? summaryForm : document.body;
-    const documentTitleMatches = /^order summary$/i.test(document.title);
-    const visibleSummaryHeading = headings.some(value => /^order summary$/i.test(value));
-    const summaryHeading = documentTitleMatches || visibleSummaryHeading;
-    const summaryState = /\/allconnect-frame\/order-summary\/?$/i.test(document.location.pathname) ||
-      /order[- ]summary/i.test(document.title) ||
-      /order[- ]summary/i.test(document.location.href) ||
-      /order[- ]summary/i.test(document.body.dataset.acPage || '');
-    const visibleLabeledValue = (labelPattern, expectedValue, kind) => {
-      const containers = Array.from(summaryRoot.querySelectorAll(
-        'tr, li, p, dd, [role="row"], [data-summary-row], .summary-row, .summary-field, .detail-row, div, section'
-      )).filter(isVisible).map(element => ({
-        element,
-        text: String(element.innerText || '').replace(/\s+/g, ' ').trim()
-      })).filter(item => item.text && item.text.length <= 180)
-        .sort((left, right) => left.text.length - right.text.length);
 
-      for (const item of containers) {
-        const matches = item.text.match(labelPattern);
-        if (!matches || matches.length !== 2) continue;
-        const value = matches[1].trim();
-        if (!value) continue;
-        if (/(?:customer\s+name|provider\b(?:\s+name)?|monthly\s+(?:total|price|payment)|installation\s+(?:total|price|fee))\s*:?/i.test(value)) continue;
-        if (kind === 'money') {
-          const cents = value.match(/\$?\s*([\d,]+(?:\.\d{1,2})?)/g) || [];
-          const expectedCents = Math.round(Number(expectedValue) * 100);
-          if (cents.length === 1 && Math.round(Number(cents[0].replace(/[$,\s]/g, '')) * 100) === expectedCents) return true;
-        } else if (value.toLowerCase() === String(expectedValue).toLowerCase()) {
-          return true;
+      if (
+        style.display === 'none' ||
+        style.visibility === 'hidden' ||
+        rect.width <= 0 ||
+        rect.height <= 0
+      ) {
+        return false;
+      }
+
+      for (
+        let parent = element.parentElement;
+        parent;
+        parent = parent.parentElement
+      ) {
+        const parentStyle = window.getComputedStyle(parent);
+
+        if (
+          parentStyle.display === 'none' ||
+          parentStyle.visibility === 'hidden'
+        ) {
+          return false;
         }
       }
-      return false;
+
+      return true;
     };
-    const errors = Array.from(document.querySelectorAll(
-      '[role="alert"], [aria-live="assertive"], .error, .validation-error, .field-error'
-    )).filter(isVisible);
-    const visibleControls = Array.from(document.querySelectorAll('button, input, select, textarea, a'))
-      .filter(isVisible).length;
-    const bodyDataset = {};
-    for (const key of ['acPage', 'sveltekitPreloadData']) {
-      if (document.body.dataset[key]) bodyDataset[key] = document.body.dataset[key];
-    }
+
+    const summary = document.querySelector('.summary');
+    const summaryContainerVisible = Boolean(
+      summary && isVisible(summary)
+    );
+
+    const summaryItems = summaryContainerVisible
+      ? Array.from(summary.querySelectorAll('.item')).filter(isVisible)
+      : [];
+
+    const summaryText = summaryContainerVisible
+      ? String(summary.innerText || '').replace(/\s+/g, ' ').trim()
+      : '';
+
+    const bodyText = document.body.innerText || '';
     const titleMatches = /^order summary$/i.test(document.title);
+
+    const summaryState =
+      /\/allconnect-frame\/order-summary\/?$/i.test(
+        document.location.pathname
+      ) ||
+      titleMatches ||
+      /order[- ]summary/i.test(
+        document.body.dataset.acPage || ''
+      );
+
+    const normalizeText = value =>
+      String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    const moneyAmounts = text => {
+      const matches = String(text || '').match(
+        /\$?\s*[\d,]+(?:\.\d{1,2})?/g
+      ) || [];
+
+      return matches.map(value => {
+        const amount = Number(value.replace(/[$,\s]/g, ''));
+        return Number.isFinite(amount)
+          ? Math.round(amount * 100)
+          : null;
+      }).filter(value => value !== null);
+    };
+
+    const summaryAmounts = moneyAmounts(summaryText);
+
+    const expectedMonthlyCents = Math.round(
+      Number(expected.monthlyPrice) * 100
+    );
+
+    const expectedInstallationCents = Math.round(
+      Number(expected.installationPrice) * 100
+    );
+
+    const providerPresent =
+      summaryContainerVisible &&
+      normalizeText(summaryText).includes(
+        normalizeText(expected.provider)
+      );
+
+    const monthlyPricePresent =
+      summaryContainerVisible &&
+      summaryAmounts.includes(expectedMonthlyCents);
+
+    const installationPricePresent =
+      summaryContainerVisible &&
+      summaryAmounts.includes(expectedInstallationCents);
+
+    const checkoutCompletedVisible =
+      /\bCHECKOUT_COMPLETED\b/i.test(summaryText) ||
+      /\bCHECKOUT_COMPLETED\b/i.test(bodyText);
+
+    const headings = Array.from(document.querySelectorAll(
+      'h1, h2, h3, h4, h5, h6, [role="heading"]'
+    )).filter(isVisible);
+
+    const bodyDataset = {};
+
+    for (const key of ['acPage', 'sveltekitPreloadData']) {
+      if (document.body.dataset[key]) {
+        bodyDataset[key] = document.body.dataset[key];
+      }
+    }
+
     return {
       url: `${document.location.origin}${document.location.pathname}`,
-      title: titleMatches ? 'Order Summary' : document.title ? '[redacted]' : '',
+      title: titleMatches ? 'Order Summary' : '',
       bodyDataset,
-      visibleSummaryHeading,
-      documentTitleMatches: titleMatches,
-      summaryHeading,
+
       summaryState,
-      summaryFormPresent,
-      checkoutCompletedVisible: /\bCHECKOUT_COMPLETED\b/i.test(bodyText),
+      summaryHeading: titleMatches,
+      visibleSummaryHeading: headings.some(element =>
+        /^order summary$/i.test(element.innerText.trim())
+      ),
+
+      summaryContainerVisible,
+      summaryItemCount: summaryItems.length,
+
+      checkoutCompletedVisible,
+
       expectedFields: {
-        customerName: visibleLabeledValue(/^(?:customer\s+)?name\s*:?\s*(.+)$/i, expected.customerName, 'text'),
-        provider: visibleLabeledValue(/^(?:(?:internet|service)\s+)?provider(?:\s+name)?\s*:?\s*(.+)$/i, expected.provider, 'text'),
-        monthlyPrice: visibleLabeledValue(/^monthly\s+(?:total|price|payment)\s*:?\s*(.+)$/i, expected.monthlyPrice, 'money'),
-        installationPrice: visibleLabeledValue(/^installation\s+(?:total|price|fee)\s*:?\s*(.+)$/i, expected.installationPrice, 'money')
+        provider: providerPresent,
+        monthlyPrice: monthlyPricePresent,
+        installationPrice: installationPricePresent
       },
-      validationErrorCount: errors.length,
+
       renderState: {
         readyState: document.readyState,
         bodyTextPresent: bodyText.trim().length > 0,
-        bodyTextLength: bodyText.length,
         visibleHeadingCount: headings.length,
-        visibleControlCount: visibleControls,
-        summaryFormPresent: Boolean(summaryForm),
-        scriptElementCount: document.scripts.length,
-        svelteKitMarkerPresent: Object.prototype.hasOwnProperty.call(document.body.dataset, 'sveltekitPreloadData')
+        summaryContainerPresent: Boolean(summary),
+        summaryContainerVisible,
+        summaryItemCount: summaryItems.length,
+        summaryTextPresent: summaryText.length > 0,
+        checkoutCompletedVisible
       }
     };
   }, requested);
 }
-
 async function clickForwardAndVerifyOrderSummary(
   page,
   checkoutFrame,
@@ -2698,6 +2966,16 @@ async function clickForwardAndVerifyOrderSummary(
   navigationBefore,
   options = {}
 ) {
+  const inspectWithTimeout = (task, timeoutMs, fallback) => new Promise(resolve => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    Promise.resolve().then(task).then(value => {
+      clearTimeout(timer);
+      resolve(value);
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve(fallback);
+    });
+  });
   const forwardControl = navigationBefore.controls.find(control =>
     control.text === 'Forward >'
   );
@@ -2738,9 +3016,10 @@ async function clickForwardAndVerifyOrderSummary(
   page.on('response', recordSummaryResponse);
 
   let domContentLoadedReached = false;
-  let networkIdleReached = false;
-  let renderWaitMs = 0;
-  let renderWaitStatus = 'not_summary_route';
+let networkIdleReached = false;
+let renderWaitMs = 0;
+let renderWaitStatus = 'not_summary_route';
+let summaryRouteDetected = false;
   const renderTimeoutMs = options.renderTimeoutMs ?? 15000;
   const summaryRoutePattern = /\/allconnect-frame\/order-summary\/?$/i;
   const isSummaryRoute = async () => {
@@ -2752,26 +3031,52 @@ async function clickForwardAndVerifyOrderSummary(
 
   try {
     // The simulator's Forward is one-shot and guarded above. Never replay it.
-    await forwardButton.click();
+    // Navigation is verified explicitly below. Do not let Playwright's
+    // implicit post-click navigation wait consume the test/run timeout when
+    // the simulator changes an iframe route without rendering summary content.
+    await forwardButton.click({ noWaitAfter: true, timeout: 5000 });
     await checkoutDocument.waitForFunction(previousUrl => {
-      if (location.href !== previousUrl) return true;
-      const visible = element => {
-        const rect = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
-        return style.display !== 'none' && style.visibility !== 'hidden' &&
-          rect.width > 0 && rect.height > 0;
-      };
-      const summaryHeading = document.title === 'Order Summary' ||
-        Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
-          .some(element => visible(element) && /^order summary$/i.test(element.innerText.trim()));
-      const summaryFormPresent = Boolean(document.querySelector('#summaryForm'));
-      const summaryRouteState = /order[- ]summary/i.test(document.body?.dataset.acPage || '');
-      const validationSelector = '[role="alert"], [aria-live="assertive"], .error, .validation-error, .field-error, [aria-invalid="true"]';
-      const visibleValidation = Array.from(document.querySelectorAll(validationSelector)).some(visible);
-      return summaryHeading || summaryFormPresent || summaryRouteState || visibleValidation;
-    }, urlBefore, { timeout: options.transitionTimeoutMs ?? 10000 }).catch(() => null);
+  if (location.href !== previousUrl) return true;
 
-    if (await isSummaryRoute()) {
+  const visible = element => {
+    if (!element) return false;
+
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+
+    return (
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+  };
+
+  const summaryTitle = /^order summary$/i.test(document.title);
+
+  const summaryRouteState =
+    /order[- ]summary/i.test(document.body?.dataset.acPage || '');
+
+  const summaryContainer = document.querySelector('.summary');
+
+  const summaryVisible = visible(summaryContainer);
+
+  const checkoutCompleted =
+    /\bCHECKOUT_COMPLETED\b/i.test(
+      document.body?.innerText || ''
+    );
+
+  return (
+    summaryTitle ||
+    summaryRouteState ||
+    (summaryVisible && checkoutCompleted)
+  );
+}, urlBefore, {
+  timeout: options.transitionTimeoutMs ?? 10000
+}).catch(() => null);
+    summaryRouteDetected = await isSummaryRoute().catch(() => false);
+
+if (summaryRouteDetected) {
       // SvelteKit may update the iframe route before its route content has
       // hydrated. Let document/network activity settle, then await visible
       // summary evidence. Neither wait triggers another action.
@@ -2793,48 +3098,32 @@ async function clickForwardAndVerifyOrderSummary(
       };
       const waitStart = Date.now();
       try {
-        await checkoutDocument.waitForFunction(values => {
-          const visible = element => {
-            const rect = element.getBoundingClientRect();
-            const style = getComputedStyle(element);
-            if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;
-            for (let parent = element.parentElement; parent; parent = parent.parentElement) {
-              const parentStyle = getComputedStyle(parent);
-              if (parentStyle.display === 'none' || parentStyle.visibility === 'hidden') return false;
-            }
-            return true;
-          };
-          const visibleHeading = Array.from(document.querySelectorAll(
-            'h1,h2,h3,h4,h5,h6,[role="heading"]'
-          )).some(element => visible(element) && /^order summary$/i.test(element.innerText.trim()));
-          const titleMatches = /^order summary$/i.test(document.title);
-          const form = document.querySelector('#summaryForm');
-          const root = form && visible(form) ? form : document.body;
-          const fieldPresent = (pattern, expected, isMoney = false) => {
-            const candidates = Array.from(root.querySelectorAll(
-              'tr, li, p, dd, [role="row"], [data-summary-row], .summary-row, .summary-field, .detail-row, div, section'
-            )).filter(visible).map(element => String(element.innerText || '').replace(/\s+/g, ' ').trim())
-              .filter(text => text && text.length <= 180).sort((a, b) => a.length - b.length);
-            for (const text of candidates) {
-              const match = text.match(pattern);
-              if (!match || match.length !== 2 || !match[1].trim()) continue;
-              if (/(?:customer\s+name|provider\b(?:\s+name)?|monthly\s+(?:total|price|payment)|installation\s+(?:total|price|fee))\s*:?/i.test(match[1])) continue;
-              if (!isMoney && match[1].trim().toLowerCase() === String(expected).toLowerCase()) return true;
-              if (isMoney) {
-                const amounts = match[1].match(/\$?\s*[\d,]+(?:\.\d{1,2})?/g) || [];
-                const expectedCents = Math.round(Number(expected) * 100);
-                if (amounts.length === 1 && Math.round(Number(amounts[0].replace(/[$,\s]/g, '')) * 100) === expectedCents) return true;
-              }
-            }
-            return false;
-          };
-          const allExpectedFieldsPresent =
-            fieldPresent(/^(?:customer\s+)?name\s*:?\s*(.+)$/i, values.customerName) &&
-            fieldPresent(/^(?:(?:internet|service)\s+)?provider(?:\s+name)?\s*:?\s*(.+)$/i, values.provider) &&
-            fieldPresent(/^monthly\s+(?:total|price|payment)\s*:?\s*(.+)$/i, values.monthlyPrice, true) &&
-            fieldPresent(/^installation\s+(?:total|price|fee)\s*:?\s*(.+)$/i, values.installationPrice, true);
-          return (visibleHeading || titleMatches) && allExpectedFieldsPresent;
-        }, expected, { timeout: renderTimeoutMs });
+        await checkoutDocument.waitForFunction(() => {
+  const summary = document.querySelector('.summary');
+
+  if (!summary) return false;
+
+  const rect = summary.getBoundingClientRect();
+  const style = getComputedStyle(summary);
+
+  const visible =
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    rect.width > 0 &&
+    rect.height > 0;
+
+  const itemCount = summary.querySelectorAll('.item').length;
+
+  const checkoutCompleted =
+    /\bCHECKOUT_COMPLETED\b/i.test(summary.innerText || '');
+
+  return (
+    /^order summary$/i.test(document.title) &&
+    visible &&
+    itemCount > 0 &&
+    checkoutCompleted
+  );
+}, undefined, { timeout: renderTimeoutMs });
         renderWaitStatus = 'summary_content_rendered';
       } catch {
         renderWaitStatus = 'summary_render_timeout';
@@ -2845,14 +3134,73 @@ async function clickForwardAndVerifyOrderSummary(
     page.off('response', recordSummaryResponse);
   }
 
-  const navigationAfter = await inspectCheckoutNavigation(checkoutFrame);
-  const summaryEvidence = await collectOrderSummaryEvidence(checkoutFrame, input);
-  const reached = hasVerifiedOrderSummary(summaryEvidence);
-  const summaryRouteDetected = await isSummaryRoute();
+  let navigationAfter = {
+  url: '[unavailable]',
+  title: '',
+  bodyDataset: {},
+  summaryFormPresent: false,
+  headings: [],
+  relevantMessages: [],
+  javascriptResourceCount: 0,
+  javascriptResources: [],
+  renderState: {
+    readyState: 'unavailable',
+    bodyTextPresent: false,
+    bodyTextLength: 0,
+    scriptElementCount: 0,
+    visibleHeadingCount: 0,
+    visibleControlCount: 0
+  },
+  forms: { count: 0 },
+  controls: []
+};
+
+let summaryEvidence = {
+  url: '[unavailable]',
+  title: '',
+  bodyDataset: {},
+  summaryState: summaryRouteDetected,
+  summaryHeading: false,
+  visibleSummaryHeading: false,
+  summaryContainerVisible: false,
+  summaryItemCount: 0,
+  checkoutCompletedVisible: false,
+  expectedFields: {
+    provider: false,
+    monthlyPrice: false,
+    installationPrice: false
+  },
+  renderState: {
+    readyState: 'unavailable',
+    bodyTextPresent: false,
+    visibleHeadingCount: 0,
+    summaryContainerPresent: false,
+    summaryContainerVisible: false,
+    summaryItemCount: 0,
+    summaryTextPresent: false,
+    checkoutCompletedVisible: false
+  }
+};
+
+// Post-navigation inspection is diagnostic only. Bound each evaluation so
+// an empty or unloading iframe cannot hold the scenario runner indefinitely.
+navigationAfter = await inspectWithTimeout(
+  () => inspectCheckoutNavigation(checkoutFrame),
+  1000,
+  navigationAfter
+);
+
+summaryEvidence = await inspectWithTimeout(
+  () => collectOrderSummaryEvidence(checkoutFrame, input),
+  1000,
+  summaryEvidence
+);
+
+const reached = hasVerifiedOrderSummary(summaryEvidence);
   if (summaryRouteDetected && !reached && renderWaitStatus === 'summary_render_timeout') {
     const renderState = summaryEvidence.renderState || {};
     renderWaitStatus = renderState.bodyTextPresent ||
-      renderState.visibleHeadingCount > 0 || renderState.summaryFormPresent
+      renderState.visibleHeadingCount > 0 || renderState.summaryContainerPresent
       ? 'timed_out_incomplete_summary'
       : 'timed_out_empty_summary';
   }
@@ -2871,13 +3219,205 @@ async function clickForwardAndVerifyOrderSummary(
 
 function hasVerifiedOrderSummary(evidence) {
   return Boolean(
-    evidence?.summaryHeading === true &&
-    evidence?.summaryFormPresent === true &&
-    evidence?.expectedFields?.customerName === true &&
+    evidence?.summaryState === true &&
+    evidence?.title === 'Order Summary' &&
+    evidence?.summaryContainerVisible === true &&
+    evidence?.summaryItemCount > 0 &&
+    evidence?.checkoutCompletedVisible === true &&
     evidence?.expectedFields?.provider === true &&
     evidence?.expectedFields?.monthlyPrice === true &&
     evidence?.expectedFields?.installationPrice === true
   );
+}
+
+
+async function verifyOrderSummary(page) {
+  const summaryFrame = page.frames().find(frame =>
+    /\/allconnect-frame\/order-summary\/?$/i.test(frame.url())
+  );
+
+  if (!summaryFrame) {
+    return {
+      reached: false,
+      finalOrderSubmitted: false
+    };
+  }
+
+  const title = await summaryFrame.evaluate(
+    () => document.title
+  );
+
+  const url = summaryFrame.url();
+  const summary = summaryFrame.locator('.summary');
+  const orderItem = summaryFrame.locator('.summary .item');
+
+  try {
+    await summary.waitFor({ state: 'visible', timeout: 5000 });
+  } catch {
+    return {
+      reached: false,
+      title,
+      url,
+      summaryVisible: false,
+      orderItemCount: 0,
+      checkoutCompleted: false,
+      finalOrderSubmitted: false
+    };
+  }
+
+  const pageContent = await summary.innerText();
+
+  const verified =
+    title === 'Order Summary' &&
+    /\/allconnect-frame\/order-summary\/?$/i.test(url) &&
+    await orderItem.count() > 0 &&
+    pageContent.includes('CHECKOUT_COMPLETED');
+
+  return {
+    reached: verified,
+    title,
+    url,
+    summaryVisible: await summary.isVisible(),
+    orderItemCount: await orderItem.count(),
+    checkoutCompleted: pageContent.includes('CHECKOUT_COMPLETED'),
+    finalOrderSubmitted: false
+  };
+}
+
+async function clickPlaceOrderAndVerify(page) {
+  const summaryFrame = page.frames().find(frame =>
+    /\/allconnect-frame\/order-summary\/?$/i.test(frame.url())
+  );
+
+  if (!summaryFrame) {
+    throw new Error('Order Summary frame was not found.');
+  }
+  const summaryHtml = await summaryFrame.locator('body').innerHTML();
+
+console.log(
+  '[DEBUG] Complete Order Summary HTML:\n',
+  summaryHtml
+);
+  const allFrameControls = [];
+
+for (const frame of page.frames()) {
+  const controls = await frame
+    .locator('button, input, a')
+    .evaluateAll(elements =>
+      elements.map(element => ({
+        tag: element.tagName,
+        id: element.id || null,
+        type: element.getAttribute('type'),
+        text: (element.innerText || element.value || '').trim(),
+        name: element.getAttribute('name'),
+        className: element.className
+      }))
+    );
+
+  allFrameControls.push({
+    frameUrl: frame.url(),
+    controls
+  });
+}
+
+console.log(
+  '[DEBUG] Controls across all frames:',
+  JSON.stringify(allFrameControls, null, 2)
+);
+  let placeOrderButton = null;
+
+for (const frame of page.frames()) {
+  const button = frame.getByRole('button', {
+    name: 'Place Order',
+    exact: true
+  });
+
+  if (await button.count() > 0 && await button.first().isVisible()) {
+    placeOrderButton = button.first();
+    break;
+  }
+}
+
+if (!placeOrderButton) {
+  throw new Error('Place Order button was not found.');
+}
+
+  await placeOrderButton.waitFor({
+    state: 'visible',
+    timeout: 15000
+  });
+
+  if (!(await placeOrderButton.isEnabled())) {
+    throw new Error('Place Order button is disabled.');
+  }
+
+  await placeOrderButton.scrollIntoViewIfNeeded();
+
+  // This is the final action in the demo simulator.
+  // It does not create a real order.
+  await placeOrderButton.click({
+    timeout: 15000,
+    noWaitAfter: true
+  });
+  await page.waitForTimeout(2000);
+
+console.log('[DEBUG] State after Place Order:', {
+  title: await page.title(),
+  url: page.url(),
+  frames: page.frames().map(frame => frame.url())
+});
+  console.log(
+    '[ACTION] Demo Place Order button click dispatched; no real order is created.'
+  );
+
+    return {
+    clicked: true,
+    reached: true,
+    orderSummaryReached: true,
+    orderConfirmationReached: false,
+    finalOrderSubmitted: false,
+    confirmationReached: false,
+    verification: 'place_order_click_dispatched'
+  };
+}
+
+async function fillPaymentField(checkoutFrame, selector, value, label) {
+  const field = checkoutFrame.locator(selector);
+  await field.waitFor({ state: 'visible', timeout: 10000 });
+  const tagName = await field.evaluate(element => element.tagName.toLowerCase());
+  if (tagName === 'select') {
+    const options = await field.locator('option').evaluateAll(elements => elements.map(option => ({
+      value: option.value,
+      label: (option.label || option.textContent || '').trim()
+    })));
+    const target = String(value);
+    const match = options.find(option => option.value === target || option.label === target) ||
+      options.find(option => label.toLowerCase().includes('year') &&
+        (option.value.endsWith(target.slice(-2)) || option.label.endsWith(target.slice(-2))));
+    if (!match) throw new Error(`No matching ${label} option was found in the simulator.`);
+    await selectFieldWithDelay(field, { value: match.value }, 'Demo Credit Check, Installation and Payment', label);
+  } else {
+    let inputValue = String(value);
+    if (label.toLowerCase().includes('year')) {
+      const maxLength = Number(await field.getAttribute('maxlength'));
+      if (maxLength === 2) inputValue = inputValue.slice(-2);
+    }
+    await fillFieldWithDelay(field, inputValue, 'Demo Credit Check, Installation and Payment', label);
+  }
+  const actual = await field.inputValue();
+  if (label.toLowerCase().includes('card number') || label.toLowerCase().includes('cvv')) {
+    if (String(actual).replace(/\D/g, '') !== String(value).replace(/\D/g, '')) {
+      throw createFieldActionError('Demo Credit Check, Installation and Payment', label, `The entered ${label} could not be verified.`);
+    }
+  } else {
+    const expectedValue = label.toLowerCase().includes('year') && String(actual).length === 2
+      ? String(value).slice(-2)
+      : String(value);
+    if (String(actual).trim().toLowerCase() !== expectedValue.trim().toLowerCase()) {
+      throw createFieldActionError('Demo Credit Check, Installation and Payment', label, `The entered ${label} could not be verified.`);
+    }
+  }
+  return field;
 }
 
 async function completeDemoCheckout(page, input) {
@@ -2888,8 +3428,12 @@ async function completeDemoCheckout(page, input) {
     payment: { performed: false, method: null, simulated: true },
     orderSummaryReached: false,
     orderSummaryVerification: null,
+    orderConfirmationReached: false,
+    orderConfirmationVerification: null,
     navigationInspection: null,
-    finalOrderSubmitted: false
+    finalOrderSubmitted: false,
+    placeOrderClicked: false,
+    placeOrderVerification: null,
   };
 
 
@@ -2975,11 +3519,11 @@ if (input.installation.type === 'professional_installation') {
     .toISOString()
     .slice(0, 10);
 
-  await installDate.fill(tomorrow);
+  await fillFieldWithDelay(installDate, tomorrow, 'Demo Credit Check, Installation and Payment', 'Install Date');
 
   // Select first available time option.
   if (await timeSelect.locator('option').count() > 1) {
-    await timeSelect.selectOption({ index: 1 });
+    await selectFieldWithDelay(timeSelect, { index: 1 }, 'Demo Credit Check, Installation and Payment', 'Preferred Time');
   }
 
   console.log('[VERIFIED] Installation date and preferred time selected.');
@@ -3002,28 +3546,54 @@ if (input.installation.type === 'professional_installation') {
     null,
     2
   ));
-  // SAFETY STOP: Do not confirm installation until the portal action
-  // and its resulting state have been independently verified.
-  console.log(
-    '[SAFE STOP] Installation option selected and verified. ' +
-    'Confirm Installation was not clicked.'
-  );
 
-  result.installation.confirmationClicked = false;
-  result.installation.confirmed = false;
-  result.stoppedSafely = true;
-  result.stopReason =
-    'Stopped before Confirm Installation; portal action semantics have not been verified.';
+  // STEP 1: CONFIRM THE SELECTED INSTALLATION OPTION.
+  const confirmInstallationButton = checkoutFrame.getByRole(
+  'button',
+  { name: 'Confirm Installation >', exact: true }
+);
 
-  return result;
+  await confirmInstallationButton.waitFor({
+    state: 'visible',
+    timeout: 10000
+  });
+
+  if (!(await confirmInstallationButton.isEnabled())) {
+    throw new Error('Confirm Installation button is disabled.');
+  }
+
+  console.log('[ACTION] Clicking Confirm Installation...');
+
+  await confirmInstallationButton.click();
+
+  // Record the click, but do not assume installation was confirmed.
+result.installation.confirmationClicked = true;
+result.installation.confirmed = false;
+
+// Inspect the actual checkout state after the click.
+result.navigationInspection = await inspectCheckoutNavigation(
+  checkoutFrame
+);
+
+console.log('\nPOST-INSTALLATION NAVIGATION INSPECTION:');
+console.log(JSON.stringify(
+  result.navigationInspection,
+  null,
+  2
+));
+
+console.log(
+  '[INSPECTION] Confirm Installation was clicked. ' +
+  'The resulting state still needs verification.'
+);
 
   // STEP 2: WAIT FOR THE FORWARD BUTTON.
   console.log('\nWaiting for the next Forward button...');
 
-  const finalForwardButton = checkoutFrame.locator(
-    'input.cbtn[value="Forward >"]'
-  );
-
+  const finalForwardButton = checkoutFrame.getByRole(
+  'button',
+  { name: 'Forward >', exact: true }
+);
   await finalForwardButton.waitFor({
     state: 'visible',
     timeout: 20000
@@ -3061,29 +3631,219 @@ if (input.installation.type === 'professional_installation') {
       return result;
     }
 
-    const summaryTransition = await clickForwardAndVerifyOrderSummary(
-      page,
-      checkoutFrame,
-      input,
-      finalForwardButton,
-      result.navigationInspection
+    // Credit-approved / no-card scenarios still have a final Authorization
+    // screen. Forward reaches that screen; it does NOT submit the order.
+    const forwardControl = result.navigationInspection.controls.find(control =>
+      control.text === 'Forward >'
     );
-    result.navigationAfterForward = summaryTransition.navigationAfter;
-    result.orderSummaryVerification = summaryTransition.summaryEvidence;
-    result.orderSummaryReached = summaryTransition.reached;
-    result.finalOrderSubmitted = false;
+    if (
+      !forwardControl ||
+      forwardControl.type !== 'button' ||
+      forwardControl.insideForm ||
+      forwardControl.formActionPresent ||
+      !(await finalForwardButton.isEnabled())
+    ) {
+      throw new Error('Credit-only Forward was not verified as a safe navigation control.');
+    }
+
+    await finalForwardButton.click({ noWaitAfter: true, timeout: 5000 });
+    console.log('[ACTION] Credit-approved Forward clicked; waiting for final Authorization.');
+
+    const submitOrder = checkoutFrame.locator('#submitOrder');
+    await submitOrder.waitFor({ state: 'visible', timeout: 15000 });
+    if (await submitOrder.count() !== 1 || !(await submitOrder.isEnabled())) {
+      throw new Error('Final Authorization Submit Order control was not uniquely available.');
+    }
+
+    const finalReadGroup = checkoutFrame.locator('label.m-read input[type="checkbox"]');
+    let finalReadIndex = -1;
+    const finalReadDeadline = Date.now() + 15000;
+    while (Date.now() < finalReadDeadline && finalReadIndex < 0) {
+      finalReadIndex = await finalReadGroup.evaluateAll(elements => {
+        const candidates = elements.map((element, index) => {
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          return {
+            index,
+            visible: style.display !== 'none' && style.visibility !== 'hidden' &&
+              rect.width > 0 && rect.height > 0,
+            checked: element.checked
+          };
+        }).filter(item => item.visible && !item.checked);
+        return candidates.length ? candidates[candidates.length - 1].index : -1;
+      });
+      if (finalReadIndex < 0) await pause(200);
+    }
+    if (finalReadIndex < 0) {
+      throw new Error('Final professional-installation Authorization Read checkbox was not found unchecked.');
+    }
+
+    const finalRead = finalReadGroup.nth(finalReadIndex);
+    await finalRead.check();
+    if (!(await finalRead.isChecked())) {
+      throw new Error('Final professional-installation Authorization Read checkbox was not verified checked.');
+    }
+    console.log('[VERIFIED] Final professional-installation Authorization Read checkbox checked.');
+
+    // Preserve the previously working Scenario 5 demo path: the scenario
+    // already passes the demo-only validation, while this local environment
+    // flag remains the explicit final-submit safety gate.
+    if (process.env.ALLOW_DEMO_ORDER_SUBMISSION !== 'true') {
+      throw new Error('Final Submit Order is locked unless ALLOW_DEMO_ORDER_SUBMISSION=true is set locally for the demo simulator.');
+    }
+
+    // The simulator may re-render the Authorization panel after Read is
+    // checked. Reacquire the checkbox and Submit Order control, then wait for
+    // the portal to enable submission. Do not click Forward or Submit twice.
+    const finalSubmitControl = checkoutFrame.locator('#submitOrder');
+    const submitReadyDeadline = Date.now() + 15000;
+    let submitReady = false;
+
+    while (Date.now() < submitReadyDeadline) {
+      const finalReadState = await finalReadGroup.evaluateAll(elements => {
+        const visible = elements.filter(element => {
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          return style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+        });
+        return {
+          visibleCount: visible.length,
+          lastVisibleChecked: visible.length > 0
+            ? visible[visible.length - 1].checked === true
+            : false
+        };
+      }).catch(() => ({ visibleCount: 0, lastVisibleChecked: false }));
+
+      const submitCount = await finalSubmitControl.count().catch(() => 0);
+      const submitVisible = submitCount === 1 &&
+        await finalSubmitControl.isVisible().catch(() => false);
+      const submitEnabled = submitVisible &&
+        await finalSubmitControl.isEnabled().catch(() => false);
+
+      if (finalReadState.lastVisibleChecked && submitEnabled) {
+        submitReady = true;
+        break;
+      }
+
+      await pause(200);
+    }
+
+    if (!submitReady) {
+      const state = await finalSubmitControl.evaluateAll(elements =>
+        elements.map(element => ({
+          disabled: element.disabled,
+          visible: !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+        }))
+      ).catch(() => []);
+      throw new Error(
+        'Final Authorization did not become ready for submission: ' +
+        'the last visible Read checkbox must remain checked and exactly one Submit Order control must be enabled. ' +
+        `Observed Submit Order controls: ${state.length}.`
+      );
+    }
+
+    await finalSubmitControl.scrollIntoViewIfNeeded();
+    console.log('[ACTION] Clicking #submitOrder on the final Authorization page...');
+
+    // This is the single final-submit action. If it fails, preserve the open
+    // browser for inspection rather than replaying a potentially dispatched order.
+    try {
+      await finalSubmitControl.click({ timeout: 15000, noWaitAfter: true });
+    } catch (clickError) {
+      const state = await checkoutFrame.locator('#submitOrder').evaluateAll(elements =>
+        elements.map(element => ({
+          disabled: element.disabled,
+          visible: !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)
+        }))
+      ).catch(() => []);
+      console.error('[ERROR] Submit Order click failed. Safe control-state count:', state.length);
+      throw new Error(`Final Submit Order click failed (${clickError.name || 'PlaywrightError'}).`);
+    }
+    console.log('[ACTION] Credit-approved demo Submit Order click dispatched; waiting for Order Summary.');
+    await pause(1000);
+
+console.log('[DEBUG] Browser state immediately after Submit Order:', {
+  pageUrl: page.url(),
+  pageTitle: await page.title().catch(() => 'Unavailable'),
+  readyState: await page.evaluate(() => document.readyState).catch(() => 'Unavailable'),
+  iframeCount: page.frames().length,
+  frameUrls: page.frames().map(frame => frame.url())
+});
+    
+let summaryFrame = null;
+const summaryDeadline = Date.now() + 20000;
+
+while (Date.now() < summaryDeadline && !summaryFrame) {
+  summaryFrame = page.frames().find(frame =>
+    /\/allconnect-frame\/order-summary\/?$/i.test(frame.url())
+  ) || null;
+
+  if (!summaryFrame) await pause(200);
+}
+
+console.log('[DEBUG] Order Summary frame detection:', {
+  found: !!summaryFrame,
+  frameUrls: page.frames().map(frame => frame.url())
+});
+
+if (!summaryFrame) {
+  throw new Error(
+    'Submit Order was clicked, but the Order Summary destination route was not reached.'
+  );
+}
+
+console.log('[VERIFIED] Order Summary iframe detected.');
+
+await summaryFrame.locator('.summary').waitFor({
+  state: 'visible',
+  timeout: 15000
+});
+
+console.log('[VERIFIED] Order Summary .summary element is visible.');
+
+const summaryVerification = await verifyOrderSummary(page);
+
+console.log('[DEBUG] Order Summary verification:', summaryVerification);
+
+if (!summaryVerification.reached) {
+  throw new Error(
+    'Order Summary route appeared, but its final content could not be verified.'
+  );
+}
+
+console.log('[VERIFIED] Order Summary content verified.');
+
+const placeOrderResult = await clickPlaceOrderAndVerify(page);
+
+    if (placeOrderResult.clicked !== true) {
+  throw new Error('Place Order click was not confirmed by Playwright.');
+}
+
+    result.placeOrderClicked = true;
+    result.placeOrderVerification = placeOrderResult;
+    result.orderConfirmationReached = false;
+result.orderConfirmationVerification = {
+  reached: false,
+  reason: 'The demo portal does not expose a separate real-order confirmation state.'
+};
+    result.orderSummaryVerification = {...summaryVerification,finalOrderSubmitted: false,placeOrderClicked: true};
+    result.orderSummaryReached = true;
+    result.finalOrderSubmitted = true;
+    result.installation.confirmed = true;
     result.payment = {
       performed: false,
       method: 'credit_approved',
       fieldsInspected: false,
       cardDetailsEntered: false,
       forwardClicked: true,
-      status: 'not_required_after_credit_approval'
+      finalReadChecked: true,
+      submitOrderClicked: true,
+      status: 'credit_approved_demo_place_order_clicked'
     };
-    result.stoppedSafely = true;
-    result.stopReason = result.orderSummaryReached
-      ? 'Verified Order Summary reached; final submission not performed.'
-      : 'Stopped after the credit-only forward transition; Order Summary was not verified.';
+    result.stoppedSafely = false;
+    result.stopReason = 'Final Authorization completed and the professional-installation Order Summary was verified.';
     return result;
   }
 
@@ -3091,46 +3851,86 @@ if (input.installation.type === 'professional_installation') {
   console.log('\n========================================');
   console.log('PREPARING PAYMENT FIELD INSPECTION');
   console.log('========================================');
+  // STEP 3: Reach the payment disclosure screen. Some simulator states show
+  // it immediately after Confirm Installation; others require one Forward.
+  // Detect the actual screen first to avoid clicking Forward past the Read box.
+  console.log('[WAIT] Checking whether the payment disclosure is already visible...');
 
-  // 1. Verify and acknowledge the payment disclosure.
-  const paymentRead = checkoutFrame.locator(
-    'input[type="checkbox"]'
+  const paymentDisclosureText = checkoutFrame.getByText(
+    /To confirm the card has sufficient funds/i
   );
+  const paymentDisclosure = checkoutFrame
+    .locator('.box.tinted')
+    .filter({ has: paymentDisclosureText });
+
+  let paymentDisclosureCount = await paymentDisclosure.count();
+
+  if (paymentDisclosureCount === 0) {
+    console.log('[ACTION] Payment disclosure not visible yet; clicking Forward once...');
+
+    if (!(await finalForwardButton.isEnabled())) {
+      throw new Error('Forward button is disabled before the payment disclosure screen.');
+    }
+
+    await finalForwardButton.click();
+    console.log('[ACTION] Forward clicked. Waiting for payment disclosure...');
+
+    await paymentDisclosureText.waitFor({ state: 'visible', timeout: 15000 });
+    paymentDisclosureCount = await paymentDisclosure.count();
+  }
+
+  result.navigationInspection = await inspectCheckoutNavigation(checkoutFrame);
+
+  console.log('\nPAYMENT DISCLOSURE SCREEN INSPECTION:');
+  console.log(JSON.stringify(result.navigationInspection, null, 2));
+
+  // 1. Acknowledge the payment-hold disclosure that appears on this screen.
+  // Scope to its own disclosure box so hidden/stale checkboxes elsewhere in
+  // the checkout iframe cannot cause an incorrect element count.
+  const paymentRead = paymentDisclosureCount === 1
+    ? paymentDisclosure.locator('label.m-read input[type="checkbox"]')
+    : checkoutFrame.locator('label.m-read input[type="checkbox"]').filter({ has: paymentDisclosureText });
 
   if (await paymentRead.count() !== 1) {
-    throw new Error(
-      'Expected exactly one payment Read checkbox.'
-    );
+    throw new Error('Expected exactly one payment sufficient-funds Read checkbox.');
   }
+
+  await paymentRead.waitFor({ state: 'visible', timeout: 15000 });
 
   if (!(await paymentRead.isChecked())) {
     await paymentRead.check();
   }
 
-  console.log(
-    '[VERIFIED] Payment Read checkbox:',
-    await paymentRead.isChecked()
-  );
+  if (!(await paymentRead.isChecked())) {
+    throw new Error('Payment sufficient-funds Read checkbox was not checked.');
+  }
 
-  // 2. Select Add a new credit card.
-  const addCardRadio = checkoutFrame.locator(
-    'input[type="radio"][name="addcard"]'
+  console.log('[VERIFIED] Payment sufficient-funds Read checkbox checked.');
+
+  // 2. Select the option by its visible label rather than assuming the
+  // simulator's internal radio-group name.
+  const addCardRadio = checkoutFrame.getByLabel(
+    'Add a new credit card',
+    { exact: true }
   );
 
   if (await addCardRadio.count() !== 1) {
     throw new Error(
-      'Expected exactly one Add a new credit card option.'
+      `Expected exactly one labelled Add a new credit card option, found ${await addCardRadio.count()}.`
     );
   }
+
+  await addCardRadio.waitFor({ state: 'visible', timeout: 10000 });
 
   if (!(await addCardRadio.isChecked())) {
     await addCardRadio.check();
   }
 
-  console.log(
-    '[VERIFIED] Add a new credit card:',
-    await addCardRadio.isChecked()
-  );
+  if (!(await addCardRadio.isChecked())) {
+    throw new Error('Add a new credit card option could not be selected.');
+  }
+
+  console.log('[VERIFIED] Add a new credit card selected.');
 
   // 3. Enable the secure fields.
   const editSecureFields = checkoutFrame.getByRole(
@@ -3147,89 +3947,198 @@ if (input.installation.type === 'professional_installation') {
 
   console.log('[ACTION] Edit Secure Fields clicked.');
 
-  // 4. Wait for a secure field to become visible instead of sleeping for a
-  // fixed interval. This path only inspects; it never fills payment details.
-  await checkoutFrame.locator('input[aria-label="Card Number"]').waitFor({
+  // 4. Select the card network from scenario data, then fill only masked
+  // synthetic card details delivered through the JWE-protected runtime input.
+  const cardType = checkoutFrame.getByLabel(/^Card Type:?$/i);
+  await cardType.waitFor({ state: 'visible', timeout: 10000 });
+  const requestedCardType = input.paymentOptions?.cardType;
+  if (!['Visa', 'MasterCard', 'American Express', 'Discover'].includes(requestedCardType)) {
+    throw new Error('A supported card type must be supplied in paymentOptions.cardType.');
+  }
+  const cardTypeOptions = await cardType.locator('option').evaluateAll(options =>
+    options.map(option => ({ value: option.value, label: (option.label || option.textContent || '').trim() }))
+  );
+  const selectedCardType = cardTypeOptions.find(option =>
+    option.label.toLowerCase() === requestedCardType.toLowerCase() ||
+    option.value.toLowerCase() === requestedCardType.toLowerCase()
+  );
+  if (!selectedCardType) throw new Error(`Requested card type is not available: ${requestedCardType}.`);
+  await selectFieldWithDelay(cardType, { value: selectedCardType.value }, 'Demo Credit Check, Installation and Payment', 'Card Type');
+  if ((await cardType.locator('option:checked').textContent()).trim().toLowerCase() !== requestedCardType.toLowerCase()) {
+    throw createFieldActionError('Demo Credit Check, Installation and Payment', 'Card Type', 'The entered Card Type could not be verified.');
+  }
+  console.log(`[VERIFIED] Card type selected: ${requestedCardType}.`);
+
+  let sensitiveData = await getFreshSensitiveData(input);
+  const payment = sensitiveData.payment;
+  if (!payment) throw new Error('EZ-Enroll payment details are missing from the encrypted input.');
+
+  const cardNumberField = checkoutFrame.getByLabel(/^Card Number:?$/i);
+  const cardHolderField = checkoutFrame.getByLabel(/^Card Holder Name:?$/i);
+  const cvvField = checkoutFrame.getByLabel(/^CVV Code:?$/i);
+  let expiryMonthField = checkoutFrame.getByLabel(/^Expiration month:?$/i);
+  let expiryYearField = checkoutFrame.getByLabel(/^Expiration year:?$/i);
+  if (await expiryMonthField.count() === 0) expiryMonthField = checkoutFrame.locator('input[placeholder="mm"]');
+  if (await expiryYearField.count() === 0) expiryYearField = checkoutFrame.locator('input[placeholder="yyyy"]');
+  for (const [field, label] of [[cardNumberField, 'Card Number'], [cardHolderField, 'Card Holder Name'], [cvvField, 'CVV Code'], [expiryMonthField, 'Expiration month'], [expiryYearField, 'Expiration year']]) {
+    await field.waitFor({ state: 'visible', timeout: 10000 });
+  }
+  await fillFieldWithDelay(cardNumberField, payment.cardNumber, 'Demo Credit Check, Installation and Payment', 'Card Number');
+  await fillFieldWithDelay(cardHolderField, payment.cardHolderName, 'Demo Credit Check, Installation and Payment', 'Card Holder Name');
+  await fillFieldWithDelay(cvvField, payment.cvv, 'Demo Credit Check, Installation and Payment', 'CVV Code');
+  await fillFieldWithDelay(expiryMonthField, payment.expirationMonth, 'Demo Credit Check, Installation and Payment', 'Expiration Month');
+  await fillFieldWithDelay(expiryYearField, payment.expirationYear, 'Demo Credit Check, Installation and Payment', 'Expiration Year');
+
+  // Verify each required card field is populated without logging its value.
+  const populatedPaymentFieldCount = await Promise.all([
+    cardNumberField, cardHolderField, cvvField, expiryMonthField, expiryYearField
+  ].map(async field => (await field.inputValue()).trim() !== '')).then(values => values.filter(Boolean).length);
+  if (populatedPaymentFieldCount !== 5) {
+    throw new Error('One or more required simulator payment fields remain empty.');
+  }
+
+  // The billing-address choice is non-sensitive scenario data.
+  const billingRadios = checkoutFrame.locator('input[type="radio"][name="billing"]');
+  if (await billingRadios.count() !== 2) throw new Error('Expected Yes/No billing-address radio options.');
+  const billingIndex = input.paymentOptions.billingAddressSameAsService ? 0 : 1;
+  const billingChoice = billingRadios.nth(billingIndex);
+  await billingChoice.check();
+  if (!(await billingChoice.isChecked())) throw new Error('Billing-address choice could not be verified.');
+  console.log(`[VERIFIED] Billing address same as service address: ${input.paymentOptions.billingAddressSameAsService ? 'Yes' : 'No'}.`);
+
+  const paymentForward = checkoutFrame.locator('input.cbtn[value="Forward >"], #forward').first();
+  await paymentForward.waitFor({ state: 'visible', timeout: 10000 });
+  if (!(await paymentForward.isEnabled())) throw new Error('Payment Forward button is disabled.');
+
+  // Re-check the seven-minute JWE window immediately before advancing.
+  sensitiveData = await getFreshSensitiveData(input);
+  const lastPayment = sensitiveData.payment;
+  await fillFieldWithDelay(cardNumberField, lastPayment.cardNumber, 'Demo Credit Check, Installation and Payment', 'Card Number');
+  await fillFieldWithDelay(cardHolderField, lastPayment.cardHolderName, 'Demo Credit Check, Installation and Payment', 'Card Holder Name');
+  await fillFieldWithDelay(cvvField, lastPayment.cvv, 'Demo Credit Check, Installation and Payment', 'CVV Code');
+  await fillFieldWithDelay(expiryMonthField, lastPayment.expirationMonth, 'Demo Credit Check, Installation and Payment', 'Expiration Month');
+  await fillFieldWithDelay(expiryYearField, lastPayment.expirationYear, 'Demo Credit Check, Installation and Payment', 'Expiration Year');
+
+  console.log('[VERIFIED] Synthetic test-card fields were populated. Card values were not logged.');
+  await paymentForward.click();
+  result.payment.forwardClicked = true;
+  result.payment.performed = true;
+
+  // The portal reveals the final authorization Read checkbox after Forward.
+  // Do not blindly use .last(): earlier disclosure checkboxes can remain in
+  // the iframe DOM. Find the last VISIBLE, UNCHECKED Read checkbox instead.
+  const finalReadGroup = checkoutFrame.locator(
+    'label.m-read input[type="checkbox"]'
+  );
+  let finalReadIndex = -1;
+  const finalReadDeadline = Date.now() + 15000;
+
+  // The final disclosure can render asynchronously after Payment Forward.
+  // Poll its actual visible/checked state without clicking Forward again.
+  while (Date.now() < finalReadDeadline && finalReadIndex < 0) {
+    finalReadIndex = await finalReadGroup.evaluateAll(elements => {
+      const visibleUnchecked = elements
+        .map((element, index) => {
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          return {
+            index,
+            visible: style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              rect.width > 0 && rect.height > 0,
+            checked: element.checked
+          };
+        })
+        .filter(item => item.visible && !item.checked);
+
+      return visibleUnchecked.length
+        ? visibleUnchecked[visibleUnchecked.length - 1].index
+        : -1;
+    });
+
+    if (finalReadIndex < 0) await pause(200);
+  }
+
+  if (finalReadIndex < 0) {
+    throw new Error(
+      'Final authorization Read checkbox was not found as a visible unchecked checkbox after Payment Forward.'
+    );
+  }
+
+  const finalRead = finalReadGroup.nth(finalReadIndex);
+  await finalRead.check();
+  if (!(await finalRead.isChecked())) {
+    throw new Error('Final authorization Read checkbox could not be verified after checking it.');
+  }
+  console.log('[VERIFIED] Final authorization Read checkbox checked.');
+
+  if (input.execution?.submitDemoOrder !== true || process.env.ALLOW_DEMO_ORDER_SUBMISSION !== 'true') {
+    throw new Error('Final Submit Order is locked unless the scenario and local demo-only environment flag both opt in.');
+  }
+
+  const submitOrder = checkoutFrame.locator(
+    'input[type="button"][value="Submit Order"], input[type="submit"][value="Submit Order"], button:has-text("Submit Order")'
+  );
+  await submitOrder.waitFor({ state: 'visible', timeout: 15000 });
+  if (await submitOrder.count() !== 1) throw new Error('Expected exactly one Submit Order control.');
+  if (!(await submitOrder.isEnabled())) throw new Error('Submit Order control is disabled.');
+
+  // Click once, then wait for the checkout iframe to reach the destination route.
+  await submitOrder.click({ noWaitAfter: true });
+  console.log('[ACTION] Submit Order clicked in the explicitly enabled demo scenario.');
+
+  let summaryFrame = null;
+  const summaryDeadline = Date.now() + 20000;
+  while (Date.now() < summaryDeadline && !summaryFrame) {
+    summaryFrame = page.frames().find(frame =>
+      /\/allconnect-frame\/order-summary\/?$/i.test(frame.url())
+    ) || null;
+    if (!summaryFrame) await pause(200);
+  }
+
+  if (!summaryFrame) {
+    throw new Error('Submit Order was clicked, but the Order Summary destination route was not reached.');
+  }
+
+  await summaryFrame.locator('.summary').waitFor({
     state: 'visible',
-    timeout: 10000
+    timeout: 15000
   });
 
-  const enabledPaymentControls = await checkoutFrame
-    .locator('input, select, textarea, button')
-    .evaluateAll(elements =>
-      elements.map((element, index) => ({
-        index,
-        tag: element.tagName,
-        type: element.getAttribute('type'),
-        disabled: element.disabled,
-        visible: !!(
-          element.offsetWidth ||
-          element.offsetHeight ||
-          element.getClientRects().length
-        ),
-        optionCount: element.tagName === 'SELECT' ? element.options.length : undefined
-      }))
-    );
+  const summaryVerification = await verifyOrderSummary(page);
+  if (!summaryVerification.reached) {
+    throw new Error('Order Summary route appeared, but its final content could not be verified.');
+  }
+  const placeOrderResult = await clickPlaceOrderAndVerify(page);
 
-  console.log('\nENABLED PAYMENT CONTROLS:');
-  console.log(
-    JSON.stringify(enabledPaymentControls, null, 2)
-  );
+  if (!placeOrderResult.reached) {
+  throw new Error('Place Order was clicked, but final confirmation could not be verified.');
+  }
 
-  result.navigationInspection = await inspectCheckoutNavigation(checkoutFrame);
-  console.log('\nCHECKOUT NAVIGATION DOM INSPECTION:');
-  console.log(JSON.stringify(result.navigationInspection, null, 2));
+  result.placeOrderClicked = true;
+  result.placeOrderVerification = placeOrderResult;
+  if (input.sensitiveData?.payment) {
+    for (const key of Object.keys(input.sensitiveData.payment)) input.sensitiveData.payment[key] = '';
+  }
 
-    console.log('\n[DIAGNOSTIC COMPLETE]');
-  console.log(
-    '[STOP] No card details entered. Forward not clicked.'
-  );
-
-  result.payment = {
-    performed: false,
-    method: null,
-    simulated: false,
-    fieldsInspected: true,
-    cardDetailsEntered: false,
-    forwardClicked: false,
-    status: 'stopped_safely'
+  result.orderSummaryReached = true;
+  result.orderSummaryVerification = {
+    ...summaryVerification,
+    finalOrderSubmitted: true
   };
+  result.finalOrderSubmitted = true;
+  result.payment = {
+    performed: true, method: 'simulator_test_card', simulated: true, fieldsInspected: true,
+    cardDetailsEntered: true, forwardClicked: true, finalReadChecked: true,
+    submitOrderClicked: true, status: 'demo_order_submitted_and_order_summary_verified'
+  };
+  result.stoppedSafely = false;
+  result.stopReason = 'Submit Order completed and the Order Summary destination was verified.';
+  return result;
 
-  result.stoppedSafely = true;
-  result.stopReason = 'Payment fields inspected; stopped before payment.';
-
-  console.log('[SAFE CHECK] Payment fields remain empty; no submit control is present.');
-  const cardFields = checkoutFrame.locator(
-    'input[aria-label="Card Number"], input[aria-label="Card Holder Name"], ' +
-    'input[aria-label="CVV Code"], input[aria-label="Expiration month"], ' +
-    'input[aria-label="Expiration year"]'
-  );
-  const populatedCardFieldCount = await cardFields.evaluateAll(elements =>
-    elements.filter(element => String(element.value || '').trim() !== '').length
-  );
-  if (populatedCardFieldCount !== 0) {
-    throw new Error('Payment fields are not empty; refusing to advance.');
-  }
-
-  if (input.accountHolder.ezEnroll === true) {
-    result.payment = {
-      performed: false,
-      method: null,
-      fieldsInspected: true,
-      cardDetailsEntered: false,
-      forwardClicked: false,
-      requiresCardDetails: true,
-      status: 'stopped_safely_requires_card'
-    };
-    result.stoppedSafely = true;
-    result.stopReason = 'EZ-Enroll requires pre-payment by card; stopped before entering card details or advancing.';
-    console.log('[SAFE STOP] EZ-Enroll requires card pre-payment; no card data entered and no Forward action taken.');
-    return result;
-  }
-  throw new Error('Unhandled simulator checkout branch.');
 }
 async function runAutomation(input) {
-  validateInput(input);
+  validateInput(input, { requireSensitiveData: true });
 
   const cfg = getConfig();
 
@@ -3335,7 +4244,21 @@ plan: {
   try {
     startExecutionStep('Portal Login');
     browser = await launchBrowser(cfg.headless);
-    context = await browser.newContext();
+    // Keep the interactive demo browser open even if final submission or
+    // Order Summary verification fails, so the last page remains inspectable.
+    if (
+      input.execution?.mode === 'demo' &&
+      input.installation?.type === 'professional_installation' &&
+      process.env.ALLOW_DEMO_ORDER_SUBMISSION === 'true'
+    ) {
+      keepBrowserOpen = true;
+    }
+    context = await browser.newContext({
+  viewport: {
+    width: 1440,
+    height: 900
+  }
+});
     page = await context.newPage();
 
     console.log('\nOpening AllConnect portal...');
@@ -3733,6 +4656,7 @@ console.log(
     const demoCheckoutResult = await completeDemoCheckout(page, input);
     keepBrowserOpen =
   demoCheckoutResult.orderSummaryReached === true ||
+  demoCheckoutResult.orderConfirmationReached === true ||
   demoCheckoutResult.stoppedSafely === true;
 
     executionReport.creditCheck = demoCheckoutResult.creditCheck;
@@ -3740,6 +4664,11 @@ console.log(
     executionReport.payment = demoCheckoutResult.payment;
     executionReport.orderSummaryReached = demoCheckoutResult.orderSummaryReached;
     executionReport.orderSummaryVerification = demoCheckoutResult.orderSummaryVerification;
+    executionReport.orderConfirmationReached = demoCheckoutResult.orderConfirmationReached === true;
+    
+    executionReport.orderConfirmationVerification = demoCheckoutResult.orderConfirmationVerification || null;
+    executionReport.placeOrderClicked = demoCheckoutResult.placeOrderClicked === true;
+    executionReport.placeOrderVerification = demoCheckoutResult.placeOrderVerification || null;
     executionReport.navigationInspection = demoCheckoutResult.navigationInspection;
     executionReport.navigationAfterForward = demoCheckoutResult.navigationAfterForward;
     executionReport.stopReason = demoCheckoutResult.stopReason || null;
@@ -3747,7 +4676,7 @@ console.log(
     executionReport.safetyCheckpoint.creditCheckPerformed = demoCheckoutResult.creditCheck.performed;
     executionReport.safetyCheckpoint.paymentPerformed = demoCheckoutResult.payment.performed;
     executionReport.safetyCheckpoint.installationConfirmed = demoCheckoutResult.installation.confirmed;
-    executionReport.safetyCheckpoint.finalOrderSubmitted = false;
+    executionReport.safetyCheckpoint.finalOrderSubmitted = demoCheckoutResult.finalOrderSubmitted === true;
 
     console.log('\nDEMO CHECKOUT RESULT');
     console.log(JSON.stringify(demoCheckoutResult, null, 2));
@@ -3765,19 +4694,23 @@ console.log(
     : '[NOT CONFIRMED] Installation confirmation was not verified.'
 );
     console.log(
-      demoCheckoutResult.payment.fieldsInspected
-        ? '[SAFE STOP] Payment fields inspected; no card details entered.'
-        : '[SKIPPED] Payment fields not inspected.'
+      demoCheckoutResult.payment.cardDetailsEntered
+        ? '[VERIFIED] Synthetic test-card fields entered and payment step advanced.'
+        : demoCheckoutResult.payment.fieldsInspected
+          ? '[INSPECTED] Payment fields inspected.'
+          : '[SKIPPED] Payment fields not inspected.'
     );
 
-    if (demoCheckoutResult.orderSummaryReached) {
-      console.log('[COMPLETED] Order Summary reached.');
-      finishExecutionStep('completed');
-      executionReport.status = 'completed';
-    } else if (demoCheckoutResult.stoppedSafely) {
+    if (demoCheckoutResult.placeOrderClicked === true) {
+  console.log(
+    '[COMPLETED] Demo Place Order click dispatched. No real order was created.'
+  );
+
+  finishExecutionStep('completed');
+  executionReport.status = 'completed';
+} else if (demoCheckoutResult.stoppedSafely) {
       console.log(
-  '[SAFE STOP] Workflow stopped before Confirm Installation. ' +
-  'Order Summary has not been reached.'
+  '[INCOMPLETE] Order Summary has not been verified.'
 );
       finishExecutionStep('stopped_safely');
       executionReport.status = 'stopped_safely';
@@ -3800,6 +4733,9 @@ console.log(
     creditCheckStage: getCreditCheckStageForError(error),
     screenshotPath: 'automation-error.png'
   });
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    error.failureDetails = executionReport.error.failure?.fieldFailure || null;
+  }
 
   console.error('\nAutomation failed:', executionReport.error.failure.type,
     `(step: ${executionReport.error.failure.step || 'unknown'})`);
@@ -3847,6 +4783,7 @@ console.log(
         executionReport.status === 'completed',
 
       orderSummaryReached: executionReport.orderSummaryReached === true,
+      orderConfirmationReached: executionReport.orderConfirmationReached === true,
       finalOrderSubmitted: executionReport.safetyCheckpoint.finalOrderSubmitted === true,
 
       safety: {
@@ -3933,162 +4870,3 @@ module.exports = {
   openInternetOffers
 };
 
-
-// Local demo execution:
-// node src/main.js
-
-if (require.main === module) {
-  const path = require('path');
-  const fs = require('fs');
-
-  const sampleOrderPath = path.join(
-    __dirname,
-    '..',
-    'test-data',
-    'sample-order.json'
-  );
-
-  try {
-    const sampleOrder = JSON.parse(
-      fs.readFileSync(sampleOrderPath, 'utf8')
-    );
-
-    // --------------------------------------------------------
-    // Validate the JSON structure before starting automation.
-    // --------------------------------------------------------
-
-    if (!sampleOrder.customer) {
-      throw new Error('Missing customer section in sample-order.json');
-    }
-
-    if (!sampleOrder.accountHolder) {
-      throw new Error('Missing accountHolder section in sample-order.json');
-    }
-
-    if (!sampleOrder.plan) {
-      throw new Error('Missing plan section in sample-order.json');
-    }
-
-    // --------------------------------------------------------
-    // Map sample-order.json to the automation input.
-    // JSON is the source of truth for customer selections.
-    // --------------------------------------------------------
-
-    const automationInput = {
-      customer: {
-        prefix: sampleOrder.customer.prefix || 'Mr',
-        firstName: sampleOrder.customer.firstName,
-        middleInitial: sampleOrder.customer.middleInitial || '',
-        lastName: sampleOrder.customer.lastName,
-        address: sampleOrder.customer.streetAddress,
-        unitNumber: sampleOrder.customer.unitNumber,
-        city: sampleOrder.customer.city,
-        zipCode: sampleOrder.customer.zipCode,
-        unitType: sampleOrder.customer.unitType,
-        state: sampleOrder.customer.state,
-        serviceAddressType: sampleOrder.customer.residenceType,
-        rentOwn: sampleOrder.customer.ownership,
-        callId: sampleOrder.customer.leadId || 'DEMO-001',
-        customerMove: sampleOrder.customer.moving,
-        moveInDate: sampleOrder.customer.moveInDate || ''
-      },
-
-      qualification: {
-        customerType: String(sampleOrder.customerType).toLowerCase()
-      },
-
-      plan: {
-        provider: sampleOrder.provider,
-        speed: `${sampleOrder.speedMbps} Mbps`,
-        term: sampleOrder.plan.term,
-        monthlyPrice: sampleOrder.plan.monthlyPrice,
-        installationPrice: sampleOrder.plan.installationPrice
-      },
-
-            checkout: {
-        broadbandFactLabels:
-          sampleOrder.checkout.broadbandFactLabels || 'not_requested',
-
-        broadbandFactLabelsRead:
-          sampleOrder.checkout.broadbandFactLabelsRead === true,
-
-        equipment:
-          sampleOrder.checkout.equipment,
-
-        nowTv:
-          sampleOrder.checkout.nowTv === true
-      },
-
-      accountHolder: {
-        contact: {
-          phone: sampleOrder.customer.phone,
-          email: sampleOrder.customer.email
-        },
-
-        isAccountHolder:
-          sampleOrder.accountHolder.isAccountHolder,
-
-        isExistingProviderCustomer:
-          sampleOrder.accountHolder.isExistingProviderCustomer,
-
-        ezEnroll:
-          sampleOrder.accountHolder.ezEnroll,
-
-        automaticPayments:
-          sampleOrder.accountHolder.automaticPayments,
-
-        readAcknowledgement:
-          sampleOrder.accountHolder.readAcknowledgement,
-
-        mailingAddressSameAsService:
-          sampleOrder.accountHolder.mailingAddressSameAsService,
-
-        shippingAddressSameAsService:
-          sampleOrder.accountHolder.shippingAddressSameAsService
-      },
-
-      identity: {
-  ssnRecordId: sampleOrder.identity?.ssnRecordId || '',
-  dateOfBirthRecordId: sampleOrder.identity?.dateOfBirthRecordId || ''
-},
-
-            installation: {
-        type: sampleOrder.installation.type,
-        confirmInstallation: false
-      },
-
-      payment: {
-        method: sampleOrder.payment?.method || 'none'
-      },
-
-      execution: {
-        mode: 'demo',
-        stopBeforeFinalOrderSubmission: true
-      }
-    };
-
-    console.log('\n========================================');
-    console.log('LOADED TEST DATA');
-    console.log('========================================');
-
-    console.log('Customer record loaded; personal details omitted.');
-
-    console.log('Provider:', automationInput.plan.provider);
-    console.log('Speed:', automationInput.plan.speed);
-    console.log('Account holder expected:', automationInput.accountHolder.isAccountHolder);
-    console.log('Existing provider customer:', automationInput.accountHolder.isExistingProviderCustomer);
-    console.log('EZ-Enroll:', automationInput.accountHolder.ezEnroll);
-    console.log('Automatic Payments:', automationInput.accountHolder.automaticPayments);
-    console.log('Mailing address same:', automationInput.accountHolder.mailingAddressSameAsService);
-    console.log('Shipping address same:', automationInput.accountHolder.shippingAddressSameAsService);
-
-    runAutomation(automationInput).catch(error => {
-      console.error('\nDemo automation stopped:', classifyError(error).type);
-      process.exitCode = 1;
-    });
-
-  } catch (error) {
-    console.error('\nUnable to load sample order:', classifyError(error).type);
-    process.exitCode = 1;
-  }
-}
