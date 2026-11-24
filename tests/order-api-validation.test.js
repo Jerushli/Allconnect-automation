@@ -57,24 +57,24 @@ test('rejects installation confirmation', () => {
   );
 });
 
-test('rejects final order submission', () => {
+test('requires explicit opt-in for the simulator Order Summary transition', () => {
   const order = createOrder();
   order.execution.stopBeforeFinalOrderSubmission = false;
 
   expect(() => mapOrderToAutomationInput(order)).toThrow(
-    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
+    'Only demo orders are accepted; the simulator Order Summary transition requires explicit demo opt-in.'
   );
 });
 
 
-test('demo final submission requires a separate local environment opt-in', () => {
+test('simulator Order Summary transition requires a separate local environment opt-in', () => {
   const scenario = JSON.parse(JSON.stringify(require('../test-data/scenarios/scenario-04-ez-enroll.json')));
   const input = mapOrderToAutomationInput(scenario);
   const previous = process.env.ALLOW_DEMO_ORDER_SUBMISSION;
   delete process.env.ALLOW_DEMO_ORDER_SUBMISSION;
   try {
     expect(() => validateInput(input)).toThrow(
-      'Demo final submission is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.'
+      'Simulator Order Summary transition is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.'
     );
   } finally {
     if (previous === undefined) delete process.env.ALLOW_DEMO_ORDER_SUBMISSION;
@@ -87,7 +87,7 @@ test('rejects non-demo execution mode', () => {
   order.execution.mode = 'production';
 
   expect(() => mapOrderToAutomationInput(order)).toThrow(
-    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
+    'Only demo orders are accepted; the simulator Order Summary transition requires explicit demo opt-in.'
   );
 });
 

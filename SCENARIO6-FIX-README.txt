@@ -1,49 +1,29 @@
-AllConnect targeted update
+AllConnect automation update notes
 
-Files in this patch
-- src/main.js
-  Restores the previously working professional-installation demo submission gate:
-  Scenario 5 no longer requires an additional submitDemoOrder property that its
-  existing scenario JSON does not provide. The local
-  ALLOW_DEMO_ORDER_SUBMISSION=true environment flag remains required. The
-  professional-installation demo browser is also kept open for inspection.
-- src/sensitiveInput.js
-  Validates DOB using a strict UTC calendar round-trip and re-prompts when the
-  entered DOB has the wrong MM/DD/YYYY format or is not a real calendar date.
-- test-data/scenarios/scenario-06-encrypted-identity.json
-  Canonical synthetic Scenario 6 input. It contains no identity or payment
-  section; those values must be entered at runtime and sent separately as JWE.
-- scripts/test-sensitive-input.js
-  Small dependency-free regression test for Scenario 6 mapping and DOB input.
+Protected workflow
+- The existing six scenario JSON files and customer / qualification / plan / checkout navigation remain unchanged.
+- The demo workflow ends at a verified Order Summary.
+- The simulator Submit Order UI transition requires both the scenario opt-in and ALLOW_DEMO_ORDER_SUBMISSION=true.
+- This transition does not submit a real order. Reports keep Order Summary, Place Order click, payment, installation confirmation, and final order submission separate.
+- The browser closes after a run by default. Set KEEP_BROWSER_OPEN=true only for local visible-browser inspection with HEADLESS=false.
 
-Install
-1. Extract this ZIP into the root of your existing allconnect-automation folder.
-2. Allow it to overwrite the listed files.
-3. Keep your existing .env file. Do not replace it with a ZIP copy.
-4. Confirm your local demo simulator setting remains:
-   ALLOW_DEMO_ORDER_SUBMISSION=true
-5. Run the targeted test:
-   node scripts/test-sensitive-input.js
-6. Run Scenario 6:
-   node src/scenarioRunner.js 6
+Sensitive input
+- Scenario JSON must not contain identity or payment fields.
+- Scenario 6 asks for synthetic SSN and DOB at runtime and sends them separately as JWE.
+- DOB must be a real calendar date in MM/DD/YYYY format; invalid dates are re-prompted.
+- The API decrypts and validates the payload in memory. Sensitive input is not persisted in job history.
 
-Scenario 6 sensitive-input flow
-- The scenario JSON must not contain identity or payment fields.
-- The runner asks for synthetic SSN and DOB in the terminal.
-- DOB must be a real calendar date in MM/DD/YYYY format.
-- If DOB is mistyped or impossible (for example, 02/31/1990), the prompt repeats.
-- The runtime payload is encrypted as JWE and sent to /api/scenarios/run.
-- The API decrypts and validates it server-side. The API rejection of plaintext
-  identity/payment sections is intentional and has not been bypassed.
+Reliability and job management
+- Browser launch, action, navigation, and total-run timeouts are configurable in .env.
+- Browser context and browser process are closed after each run unless local inspection is explicitly enabled.
+- New asynchronous API jobs use one worker, queue waiting jobs, support queued-job cancellation, and expose job status/history.
+- Sanitized job metadata is persisted in .data/jobs.json. Queued/running jobs are marked interrupted after a process restart; sensitive inputs are never persisted or resumed.
+- Existing synchronous API endpoints retain their response behavior and reject a second request while the worker is occupied.
 
-Scope
-- Scenario 6: DOB input validation/re-prompt only; encrypted API flow preserved.
-- Scenario 5: only the extra scenario-level submitDemoOrder requirement added in
-  the previous patch is removed. The local demo environment opt-in remains.
-- No other scenario workflow was intentionally changed.
+Verification commands
+- npm run test:jobs
+- npm run test:sensitive
+- npm run test:jwe
+- npm test
 
-Verification performed in the build environment
-- node --check src/main.js: passed
-- node --check src/sensitiveInput.js: passed
-- node scripts/test-sensitive-input.js: passed
-- Full Playwright suite/live portal run: not performed in this environment.
+The dependency-free checks were run in the build environment. The complete Playwright suite requires npm dependencies and a Chromium installation; it must be run in the target environment before treating the release as fully verified.

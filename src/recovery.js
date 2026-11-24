@@ -124,7 +124,9 @@ function classifyError(error, context = {}) {
   const fieldFailure = sanitizeFieldFailure(error?.failureDetails);
   if (fieldFailure) type = 'form_validation';
 
-  if (/unauthorized|authentication|password missing|401|forbidden/.test(text)) {
+  if (error?.code === 'AUTOMATION_TIMEOUT') {
+    type = 'timeout';
+  } else if (/unauthorized|authentication|password missing|401|forbidden/.test(text)) {
     type = 'authentication';
   } else if (/^(SSN_|DOB_|CVV_|EXPIRY_|TEST_CARD_|SENSITIVE_|IDENTITY_PAYLOAD_|PAYMENT_PAYLOAD_)/.test(String(error?.code || '')) || /synthetic test.card|ssn must|dob must|dob is not|cvv must|expiry must|test.card expiry|sensitive jwe payload|encrypted identity payload|encrypted payment payload/i.test(message)) {
     type = 'input_validation';

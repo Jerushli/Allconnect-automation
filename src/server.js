@@ -16,6 +16,7 @@ const { classifyError } = require('./recovery');
 const { decryptJwe } = require('./encryption');
 const { ensureServerKeyPair } = require('./keyManagement');
 const { validateSensitivePayload, zeroSensitivePayload } = require('./sensitiveInput');
+const { JobManager } = require('./jobManager');
 
 function safeFailureCode(error) {
   if (/^(SSN_|DOB_|CVV_|EXPIRY_|TEST_CARD_|SENSITIVE_|IDENTITY_PAYLOAD_|PAYMENT_PAYLOAD_)[A-Z0-9_]*$/.test(String(error?.code || ''))) {
@@ -32,13 +33,14 @@ function safeFailureCode(error) {
     ['Simulator test-card expiry must be in the future.', 'TEST_CARD_EXPIRED']
   ]);
   if (error?.code === 'SENSITIVE_INPUT_EXPIRED') return 'SENSITIVE_INPUT_EXPIRED';
+  if (error?.code === 'AUTOMATION_TIMEOUT') return 'AUTOMATION_TIMEOUT';
   if (error?.code === 'FORM_FIELD_ACTION_FAILED') return 'FIELD_VALIDATION_FAILED';
   return known.get(String(error?.message || '')) || 'SCENARIO_VALIDATION_FAILED';
 }
 
 function saveApiFailureReport({ runId, stage, type, code }) {
   const directory = path.resolve(__dirname, '..', 'reports');
-  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const safeRunId = /^[a-f0-9-]{36}$/i.test(runId || '') ? runId : crypto.randomUUID();
   const report = {
@@ -47,11 +49,19 @@ function saveApiFailureReport({ runId, stage, type, code }) {
     finishedAt: new Date().toISOString(),
     status: 'failed',
     failure: { stage, type, code },
-    summary: { status: 'failed', failedStep: stage, orderSummaryReached: false, finalOrderSubmitted: false },
+    durationMs: 0,
+    summary: { status: 'failed', failedStep: stage, orderSummaryReached: false, placeOrderClicked: false, finalOrderSubmitted: false },
     safetyCheckpoint: { creditCheckPerformed: false, paymentPerformed: false, installationConfirmed: false, finalOrderSubmitted: false }
   };
   const filePath = path.join(directory, `execution-report-${timestamp}-${safeRunId.slice(0, 8)}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(report, null, 2), { encoding: 'utf8', mode: 0o600 });
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(report, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch { /* temporary file may not exist */ }
+    throw error;
+  }
   return filePath;
 }
 
@@ -70,7 +80,40 @@ function createApp(options = {}) {
   const app = express();
   const jweKeys = options.jweKeys || ensureServerKeyPair();
 
-  let isAutomationRunning = false;
+  const jobManager = options.jobManager || new JobManager({ filePath: options.jobStorePath });
+  app.locals.jobManager = jobManager;
+
+  async function executeQueuedAutomation(automationInput, jobId, cleanup) {
+    automationInput.execution = { ...(automationInput.execution || {}), runId: jobId };
+    try {
+      return await runAutomation(automationInput);
+    } catch (error) {
+      const failure = classifyError(error);
+      if (error?.code === 'SENSITIVE_INPUT_EXPIRED') {
+        try {
+          saveApiFailureReport({
+            runId: jobId,
+            stage: 'sensitive_input_preflight',
+            type: 'input_validation',
+            code: 'SENSITIVE_INPUT_EXPIRED'
+          });
+        } catch {
+          console.error('[API] Could not write sanitized expired-input report.');
+        }
+      }
+      if (error && (typeof error === 'object' || typeof error === 'function')) {
+        error.failureType = failure.type;
+        error.failureCode = error.code === 'AUTOMATION_TIMEOUT'
+          ? 'AUTOMATION_TIMEOUT'
+          : error.code === 'SENSITIVE_INPUT_EXPIRED'
+            ? 'SENSITIVE_INPUT_EXPIRED'
+            : failure.fieldFailure ? 'FIELD_VALIDATION_FAILED' : 'AUTOMATION_FAILED';
+      }
+      throw error;
+    } finally {
+      if (typeof cleanup === 'function') cleanup();
+    }
+  }
 
   app.use(express.json({
     limit: '32kb'
@@ -84,7 +127,9 @@ function createApp(options = {}) {
     res.status(200).json({
       status: 'ok',
       service: 'AllConnect Order Automation API',
-      automationRunning: isAutomationRunning
+      automationRunning: jobManager.isRunning,
+      queuedJobs: jobManager.queueLength,
+      activeJobId: jobManager.activeId
     });
   });
 
@@ -136,7 +181,7 @@ function createApp(options = {}) {
   // ----------------------------------------------------------
 
   app.post('/api/scenarios/run', authenticateApiToken, async (req, res) => {
-    if (isAutomationRunning) {
+    if (jobManager.isRunning || jobManager.queueLength > 0) {
       return res.status(409).json({ status: 'rejected', message: 'Another automation run is already in progress.' });
     }
 
@@ -188,10 +233,12 @@ function createApp(options = {}) {
       });
     }
 
-    const runId = crypto.randomUUID();
-    isAutomationRunning = true;
+    const queued = jobManager.enqueue(() => executeQueuedAutomation(automationInput, queued.job.id, () => zeroSensitivePayload(decryptedSensitiveData)), { source: 'legacy_scenario_api' });
+    const runId = queued.job.id;
     try {
-      const report = await runAutomation(automationInput);
+      const completion = await queued.completion;
+      if (completion.error) throw completion.error;
+      const report = completion.report || {};
       return res.status(200).json({
         runId,
         status: report.status || 'unknown',
@@ -221,7 +268,7 @@ function createApp(options = {}) {
         status: 'failed',
         failureType,
         failureStage: 'automation',
-        failureCode: failure.fieldFailure ? 'FIELD_VALIDATION_FAILED' : 'AUTOMATION_FAILED',
+        failureCode: error.code === 'AUTOMATION_TIMEOUT' ? 'AUTOMATION_TIMEOUT' : failure.fieldFailure ? 'FIELD_VALIDATION_FAILED' : 'AUTOMATION_FAILED',
         failureStep: failure.step || null,
         fieldFailure: failure.fieldFailure || null,
         reportSaved: Boolean(reportPath),
@@ -229,8 +276,81 @@ function createApp(options = {}) {
       });
     } finally {
       zeroSensitivePayload(decryptedSensitiveData);
-      isAutomationRunning = false;
     }
+  });
+
+  // ----------------------------------------------------------
+  // ASYNC JOB API: queued execution and persistent job history
+  // ----------------------------------------------------------
+
+  app.post('/api/jobs', authenticateApiToken, async (req, res) => {
+    let automationInput;
+    let decryptedSensitiveData;
+    try {
+      if (!req.body || typeof req.body !== 'object' || !req.body.order || typeof req.body.sensitiveJwe !== 'string') {
+        throw new Error('Scenario order and encrypted sensitive payload are required.');
+      }
+      automationInput = mapOrderToAutomationInput(req.body.order);
+      decryptedSensitiveData = decryptJwe(req.body.sensitiveJwe, jweKeys.privateKey, jweKeys.kid);
+      validateSensitivePayload(decryptedSensitiveData, req.body.order);
+      automationInput.sensitiveData = decryptedSensitiveData;
+      if (typeof options.requestSensitiveRefresh === 'function') {
+        automationInput.requestSensitiveRefresh = async () => {
+          const refreshed = await options.requestSensitiveRefresh(req.body.order);
+          validateSensitivePayload(refreshed, req.body.order);
+          return refreshed;
+        };
+      }
+      validateInput(automationInput, { requireSensitiveData: true });
+    } catch (error) {
+      zeroSensitivePayload(decryptedSensitiveData);
+      const expired = error.code === 'SENSITIVE_INPUT_EXPIRED';
+      return res.status(expired ? 428 : 400).json({
+        status: expired ? 'sensitive_input_expired' : 'invalid_scenario',
+        failureStage: 'input_validation',
+        failureCode: safeFailureCode(error),
+        message: expired ? 'Sensitive input expired. Enter the required details again.' : 'Scenario validation or encrypted-input verification failed.'
+      });
+    }
+
+    try {
+      const queued = jobManager.enqueue(() => executeQueuedAutomation(automationInput, queued.job.id, () => zeroSensitivePayload(decryptedSensitiveData)), { source: 'async_scenario_api', onCancel: () => zeroSensitivePayload(decryptedSensitiveData) });
+      return res.status(202).json({
+        jobId: queued.job.id,
+        status: queued.job.status,
+        statusUrl: `/api/jobs/${queued.job.id}`,
+        message: 'Automation job accepted and queued.'
+      });
+    } catch (error) {
+      zeroSensitivePayload(decryptedSensitiveData);
+      const full = error.code === 'JOB_QUEUE_FULL';
+      return res.status(full ? 429 : 500).json({
+        status: 'rejected',
+        failureCode: full ? 'JOB_QUEUE_FULL' : 'JOB_ENQUEUE_FAILED',
+        message: full ? 'Automation queue is full. Try again later.' : 'Automation job could not be queued.'
+      });
+    }
+  });
+
+  app.get('/api/jobs', authenticateApiToken, (req, res) => {
+    const limit = Number.parseInt(req.query.limit, 10) || 50;
+    return res.status(200).json({ jobs: jobManager.list(limit), queueLength: jobManager.queueLength, automationRunning: jobManager.isRunning });
+  });
+
+  app.get('/api/jobs/:jobId', authenticateApiToken, (req, res) => {
+    const job = jobManager.get(req.params.jobId);
+    if (!job) return res.status(404).json({ status: 'not_found', message: 'Job was not found.' });
+    return res.status(200).json({ job });
+  });
+
+  app.post('/api/jobs/:jobId/cancel', authenticateApiToken, (req, res) => {
+    const cancelled = jobManager.cancel(req.params.jobId);
+    if (!cancelled) {
+      const job = jobManager.get(req.params.jobId);
+      if (!job) return res.status(404).json({ status: 'not_found', message: 'Job was not found.' });
+      return res.status(409).json({ status: job.status, message: 'Only queued jobs can be cancelled.' });
+    }
+    return res.status(200).json({ job: jobManager.get(req.params.jobId) });
   });
 
   // ----------------------------------------------------------
@@ -247,7 +367,7 @@ function createApp(options = {}) {
           message: 'Use POST /api/scenarios/run with a JWE-encrypted sensitive payload.'
         });
       }
-      if (isAutomationRunning) {
+      if (jobManager.isRunning || jobManager.queueLength > 0) {
         return res.status(409).json({
           status: 'rejected',
           message: 'Another automation run is already in progress.'
@@ -269,16 +389,17 @@ function createApp(options = {}) {
         });
       }
 
-      const runId = crypto.randomUUID();
-
-      isAutomationRunning = true;
+      const queued = jobManager.enqueue(() => executeQueuedAutomation(automationInput, queued.job.id), { source: 'legacy_order_api' });
+      const runId = queued.job.id;
 
       console.log(
         `\n[API] Order automation started. Run ID: ${runId}`
       );
 
       try {
-        const report = await runAutomation(automationInput);
+        const completion = await queued.completion;
+        if (completion.error) throw completion.error;
+        const report = completion.report || {};
 
         console.log(
           `[API] Order automation finished. Run ID: ${runId}`
@@ -305,13 +426,14 @@ function createApp(options = {}) {
           runId,
           status: 'failed',
           failureType: failure.type,
+          failureCode: error.code === 'AUTOMATION_TIMEOUT' ? 'AUTOMATION_TIMEOUT' : failure.fieldFailure ? 'FIELD_VALIDATION_FAILED' : 'AUTOMATION_FAILED',
           failureStep: failure.step || null,
           fieldFailure: failure.fieldFailure || null,
           message: failure.fieldFailure?.message || 'Automation failed. Check the local server logs and execution reports.'
         });
 
       } finally {
-        isAutomationRunning = false;
+        // The job manager owns the single-worker lifecycle and releases the slot.
       }
     }
   );
@@ -357,7 +479,7 @@ function createApp(options = {}) {
 function startServer() {
   const app = createApp();
 
-  return app.listen(PORT, '127.0.0.1', () => {
+  const server = app.listen(PORT, '127.0.0.1', () => {
     console.log('\n======================================');
     console.log(' ALLCONNECT AUTOMATION API');
     console.log('======================================');
@@ -365,9 +487,49 @@ function startServer() {
     console.log(`Health: http://localhost:${PORT}/health`);
     console.log(`Orders: POST http://localhost:${PORT}/api/orders`);
     console.log(`Scenario JWE: POST http://localhost:${PORT}/api/scenarios/run`);
+    console.log(`Async jobs: POST/GET http://localhost:${PORT}/api/jobs`);
     console.log('JWE public key: GET http://localhost:${PORT}/api/crypto/public-key');
     console.log('======================================\n');
   });
+
+  let shuttingDown = false;
+  const shutdown = signal => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[API] ${signal} received. Stopping new requests, cancelling queued jobs, and waiting for the active browser to clean up...`);
+    app.locals.jobManager.cancelQueued();
+    const maxRuntime = Number.parseInt(process.env.AUTOMATION_MAX_RUNTIME_MS, 10) || 900000;
+    const forceTimer = setTimeout(() => {
+      console.error('[API] Graceful shutdown deadline reached; closing remaining HTTP connections.');
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    }, Math.min(Math.max(maxRuntime + 30000, 60000), 3660000));
+    if (typeof forceTimer.unref === 'function') forceTimer.unref();
+    let httpClosed = false;
+    let jobsIdle = false;
+    let shutdownError = null;
+    const finishShutdown = () => {
+      if (!httpClosed || !jobsIdle) return;
+      clearTimeout(forceTimer);
+      if (shutdownError) {
+        console.error('[API] Server shutdown encountered an error.');
+        process.exitCode = 1;
+      } else {
+        console.log('[API] Server and automation worker stopped cleanly.');
+      }
+    };
+    server.close(error => {
+      shutdownError = error || null;
+      httpClosed = true;
+      finishShutdown();
+    });
+    app.locals.jobManager.waitForIdle().then(() => {
+      jobsIdle = true;
+      finishShutdown();
+    });
+  };
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  return server;
 }
 
 // Only start listening when this file is run directly.

@@ -1,6 +1,7 @@
 ﻿
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { getConfig } = require('./config');
 const { launchBrowser } = require('./browser');
@@ -154,29 +155,23 @@ async function saveDiagnosticScreenshot(page, screenshotPath) {
 
 function saveExecutionReport(report) {
   const reportsDirectory = path.resolve(__dirname, '..', 'reports');
-
-  fs.mkdirSync(reportsDirectory, {
-    recursive: true
-  });
-
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, '-');
-
-  const filePath = path.join(
-    reportsDirectory,
-    `execution-report-${timestamp}.json`
-  );
-
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify(sanitizeExecutionReport(report), null, 2),
-    'utf8'
-  );
-
+  fs.mkdirSync(reportsDirectory, { recursive: true, mode: 0o700 });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const runSuffix = String(report.runId || crypto.randomUUID()).replace(/[^a-f0-9-]/gi, '').slice(0, 36);
+  const filePath = path.join(reportsDirectory, `execution-report-${timestamp}-${runSuffix}.json`);
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(sanitizeExecutionReport(report), null, 2), {
+      encoding: 'utf8',
+      mode: 0o600
+    });
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch { /* temporary file may not exist */ }
+    throw error;
+  }
   console.log('\nEXECUTION REPORT SAVED');
   console.log(filePath);
-
   return filePath;
 }
 // ============================================================
@@ -367,12 +362,12 @@ function validateInput(input, options = {}) {
     (input.execution.stopBeforeFinalOrderSubmission !== true && !submitDemoOrder) ||
     (submitDemoOrder && input.execution.mode !== 'demo')
   ) {
-    throw new Error('Final submission is permitted only for an explicitly opted-in demo run.');
+    throw new Error('The simulator Order Summary transition requires an explicitly opted-in demo run.');
   }
 
   if (submitDemoOrder) {
     if (process.env.ALLOW_DEMO_ORDER_SUBMISSION !== 'true') {
-      throw new Error('Demo final submission is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.');
+      throw new Error('Simulator Order Summary transition is locked. Set ALLOW_DEMO_ORDER_SUBMISSION=true locally only for the isolated demo portal.');
     }
     // EZ-Enroll runs require synthetic card details. Credit-approved runs
     // (ezEnroll=false) do not enter card details and proceed via authorization.
@@ -2477,10 +2472,10 @@ async function runSimulatorCreditCheck(checkoutFrame, input) {
     console.log('[VERIFIED] Simulator credit-check result:', safeStatus);
     if (!approved) {
       const error = new Error('Simulator credit check did not return an approval; automation stopped.');
-      error.creditCheckResult = { performed: true, approved: false, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
+      error.creditCheckResult = { performed: true, simulated: true, approved: false, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
       throw error;
     }
-    return { performed: true, approved: true, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
+    return { performed: true, simulated: true, approved: true, status: safeStatus, dataSource: 'jwe-client-encrypted-input' };
   } catch (error) {
     if (error && (typeof error === 'object' || typeof error === 'function')) {
       creditCheckFailureStages.set(error, creditCheckStage);
@@ -3284,100 +3279,23 @@ async function verifyOrderSummary(page) {
   };
 }
 
-async function clickPlaceOrderAndVerify(page) {
-  const summaryFrame = page.frames().find(frame =>
-    /\/allconnect-frame\/order-summary\/?$/i.test(frame.url())
-  );
-
-  if (!summaryFrame) {
-    throw new Error('Order Summary frame was not found.');
+async function verifyFinalOrderSummaryCheckpoint(page) {
+  // The simulator's verified Order Summary is the final supported checkpoint.
+  // A Place Order control is not guaranteed to exist on this destination, and
+  // this demo must never infer a real order submission from a UI transition.
+  const verification = await verifyOrderSummary(page);
+  if (!verification.reached) {
+    throw new Error('Order Summary was not verified at the final demo checkpoint.');
   }
-  const summaryHtml = await summaryFrame.locator('body').innerHTML();
-
-console.log(
-  '[DEBUG] Complete Order Summary HTML:\n',
-  summaryHtml
-);
-  const allFrameControls = [];
-
-for (const frame of page.frames()) {
-  const controls = await frame
-    .locator('button, input, a')
-    .evaluateAll(elements =>
-      elements.map(element => ({
-        tag: element.tagName,
-        id: element.id || null,
-        type: element.getAttribute('type'),
-        text: (element.innerText || element.value || '').trim(),
-        name: element.getAttribute('name'),
-        className: element.className
-      }))
-    );
-
-  allFrameControls.push({
-    frameUrl: frame.url(),
-    controls
-  });
-}
-
-console.log(
-  '[DEBUG] Controls across all frames:',
-  JSON.stringify(allFrameControls, null, 2)
-);
-  let placeOrderButton = null;
-
-for (const frame of page.frames()) {
-  const button = frame.getByRole('button', {
-    name: 'Place Order',
-    exact: true
-  });
-
-  if (await button.count() > 0 && await button.first().isVisible()) {
-    placeOrderButton = button.first();
-    break;
-  }
-}
-
-if (!placeOrderButton) {
-  throw new Error('Place Order button was not found.');
-}
-
-  await placeOrderButton.waitFor({
-    state: 'visible',
-    timeout: 15000
-  });
-
-  if (!(await placeOrderButton.isEnabled())) {
-    throw new Error('Place Order button is disabled.');
-  }
-
-  await placeOrderButton.scrollIntoViewIfNeeded();
-
-  // This is the final action in the demo simulator.
-  // It does not create a real order.
-  await placeOrderButton.click({
-    timeout: 15000,
-    noWaitAfter: true
-  });
-  await page.waitForTimeout(2000);
-
-console.log('[DEBUG] State after Place Order:', {
-  title: await page.title(),
-  url: page.url(),
-  frames: page.frames().map(frame => frame.url())
-});
-  console.log(
-    '[ACTION] Demo Place Order button click dispatched; no real order is created.'
-  );
-
-    return {
-    clicked: true,
+  console.log('[VERIFIED] Order Summary reached. Stopping before any real order submission.');
+  return {
+    clicked: false,
     reached: true,
     orderSummaryReached: true,
     orderConfirmationReached: false,
     finalOrderSubmitted: false,
     confirmationReached: false,
-    verification: 'place_order_click_dispatched'
+    verification: 'verified_order_summary_safe_stop'
   };
 }
 
@@ -3427,12 +3345,12 @@ async function completeDemoCheckout(page, input) {
     installation: { requested: input.installation.type, selected: null, verified: false, confirmed: false },
     payment: { performed: false, method: null, simulated: true },
     orderSummaryReached: false,
+    placeOrderClicked: false,
+    finalOrderSubmitted: false,
     orderSummaryVerification: null,
     orderConfirmationReached: false,
     orderConfirmationVerification: null,
     navigationInspection: null,
-    finalOrderSubmitted: false,
-    placeOrderClicked: false,
     placeOrderVerification: null,
   };
 
@@ -3815,35 +3733,35 @@ if (!summaryVerification.reached) {
 
 console.log('[VERIFIED] Order Summary content verified.');
 
-const placeOrderResult = await clickPlaceOrderAndVerify(page);
+const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page);
 
-    if (placeOrderResult.clicked !== true) {
-  throw new Error('Place Order click was not confirmed by Playwright.');
-}
+    if (placeOrderResult.reached !== true) {
+      throw new Error('Order Summary safe-stop checkpoint was not verified.');
+    }
 
-    result.placeOrderClicked = true;
+    result.placeOrderClicked = false;
     result.placeOrderVerification = placeOrderResult;
     result.orderConfirmationReached = false;
 result.orderConfirmationVerification = {
   reached: false,
   reason: 'The demo portal does not expose a separate real-order confirmation state.'
 };
-    result.orderSummaryVerification = {...summaryVerification,finalOrderSubmitted: false,placeOrderClicked: true};
+    result.orderSummaryVerification = { ...summaryVerification, finalOrderSubmitted: false, placeOrderClicked: false };
     result.orderSummaryReached = true;
-    result.finalOrderSubmitted = true;
-    result.installation.confirmed = true;
+    result.finalOrderSubmitted = false;
+    result.installation.confirmed = false;
     result.payment = {
       performed: false,
-      method: 'credit_approved',
+      method: 'credit_approved_demo',
       fieldsInspected: false,
       cardDetailsEntered: false,
       forwardClicked: true,
       finalReadChecked: true,
       submitOrderClicked: true,
-      status: 'credit_approved_demo_place_order_clicked'
+      status: 'order_summary_verified_safe_stop'
     };
     result.stoppedSafely = false;
-    result.stopReason = 'Final Authorization completed and the professional-installation Order Summary was verified.';
+    result.stopReason = 'Professional-installation Order Summary verified; no real order was submitted.';
     return result;
   }
 
@@ -4109,13 +4027,13 @@ result.orderConfirmationVerification = {
   if (!summaryVerification.reached) {
     throw new Error('Order Summary route appeared, but its final content could not be verified.');
   }
-  const placeOrderResult = await clickPlaceOrderAndVerify(page);
+  const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page);
 
   if (!placeOrderResult.reached) {
-  throw new Error('Place Order was clicked, but final confirmation could not be verified.');
+    throw new Error('Order Summary safe-stop checkpoint was not verified.');
   }
 
-  result.placeOrderClicked = true;
+  result.placeOrderClicked = false;
   result.placeOrderVerification = placeOrderResult;
   if (input.sensitiveData?.payment) {
     for (const key of Object.keys(input.sensitiveData.payment)) input.sensitiveData.payment[key] = '';
@@ -4124,16 +4042,17 @@ result.orderConfirmationVerification = {
   result.orderSummaryReached = true;
   result.orderSummaryVerification = {
     ...summaryVerification,
-    finalOrderSubmitted: true
+    finalOrderSubmitted: false,
+    placeOrderClicked: false
   };
-  result.finalOrderSubmitted = true;
+  result.finalOrderSubmitted = false;
   result.payment = {
-    performed: true, method: 'simulator_test_card', simulated: true, fieldsInspected: true,
+    performed: false, method: 'simulator_test_card', simulated: true, fieldsInspected: true,
     cardDetailsEntered: true, forwardClicked: true, finalReadChecked: true,
-    submitOrderClicked: true, status: 'demo_order_submitted_and_order_summary_verified'
+    submitOrderClicked: true, status: 'order_summary_verified_safe_stop'
   };
   result.stoppedSafely = false;
-  result.stopReason = 'Submit Order completed and the Order Summary destination was verified.';
+  result.stopReason = 'Simulator Submit Order transition reached a verified Order Summary; no real order was submitted.';
   return result;
 
 }
@@ -4148,12 +4067,14 @@ async function runAutomation(input) {
   let context;
   let page;
   let keepBrowserOpen = false;
+  let automationTimedOut = false;
+  let automationTimer = null;
   let accountHolderReport;
   let accountHolderForwardReport;
   let installationReport;
 
   const executionReport = {
-    runId: new Date(reportStartTime).toISOString(),
+    runId: /^[a-f0-9-]{36}$/i.test(input.execution?.runId || '') ? input.execution.runId : crypto.randomUUID(),
     startedAt: new Date(reportStartTime).toISOString(),
     finishedAt: null,
     durationMs: null,
@@ -4184,7 +4105,12 @@ plan: {
     creditCheck: null,
     payment: null,
     orderSummaryReached: false,
+    placeOrderClicked: false,
+    finalOrderSubmitted: false,
     orderSummaryVerification: null,
+    orderConfirmationReached: false,
+    orderConfirmationVerification: null,
+    placeOrderVerification: null,
     navigationInspection: null,
     navigationAfterForward: null,
     stopReason: null,
@@ -4243,13 +4169,18 @@ plan: {
   }
   try {
     startExecutionStep('Portal Login');
-    browser = await launchBrowser(cfg.headless);
-    // Keep the interactive demo browser open even if final submission or
-    // Order Summary verification fails, so the last page remains inspectable.
+    browser = await launchBrowser(cfg.headless, { timeout: cfg.browserLaunchTimeoutMs });
+    automationTimer = setTimeout(() => {
+      automationTimedOut = true;
+      if (context) context.close().catch(() => {});
+      if (browser) browser.close().catch(() => {});
+    }, cfg.maxRuntimeMs);
+    if (typeof automationTimer.unref === 'function') automationTimer.unref();
+    // Browser retention is opt-in for local interactive inspection only.
     if (
       input.execution?.mode === 'demo' &&
-      input.installation?.type === 'professional_installation' &&
-      process.env.ALLOW_DEMO_ORDER_SUBMISSION === 'true'
+      process.env.KEEP_BROWSER_OPEN === 'true' &&
+      cfg.headless === false
     ) {
       keepBrowserOpen = true;
     }
@@ -4260,6 +4191,8 @@ plan: {
   }
 });
     page = await context.newPage();
+    page.setDefaultTimeout(cfg.actionTimeoutMs);
+    page.setDefaultNavigationTimeout(cfg.navigationTimeoutMs);
 
     console.log('\nOpening AllConnect portal...');
 
@@ -4654,10 +4587,7 @@ console.log(
     // STEP 18: COMPLETE THE LOCALLY SIMULATED CREDIT / INSTALL / PAYMENT FLOW.
     startExecutionStep('Demo Credit Check, Installation and Payment');
     const demoCheckoutResult = await completeDemoCheckout(page, input);
-    keepBrowserOpen =
-  demoCheckoutResult.orderSummaryReached === true ||
-  demoCheckoutResult.orderConfirmationReached === true ||
-  demoCheckoutResult.stoppedSafely === true;
+    keepBrowserOpen = process.env.KEEP_BROWSER_OPEN === 'true' && cfg.headless === false;
 
     executionReport.creditCheck = demoCheckoutResult.creditCheck;
     executionReport.installation = demoCheckoutResult.installation;
@@ -4668,13 +4598,14 @@ console.log(
     
     executionReport.orderConfirmationVerification = demoCheckoutResult.orderConfirmationVerification || null;
     executionReport.placeOrderClicked = demoCheckoutResult.placeOrderClicked === true;
+    executionReport.finalOrderSubmitted = demoCheckoutResult.finalOrderSubmitted === true;
     executionReport.placeOrderVerification = demoCheckoutResult.placeOrderVerification || null;
     executionReport.navigationInspection = demoCheckoutResult.navigationInspection;
     executionReport.navigationAfterForward = demoCheckoutResult.navigationAfterForward;
     executionReport.stopReason = demoCheckoutResult.stopReason || null;
 
-    executionReport.safetyCheckpoint.creditCheckPerformed = demoCheckoutResult.creditCheck.performed;
-    executionReport.safetyCheckpoint.paymentPerformed = demoCheckoutResult.payment.performed;
+    executionReport.safetyCheckpoint.creditCheckPerformed = demoCheckoutResult.creditCheck.performed === true && demoCheckoutResult.creditCheck.simulated !== true;
+    executionReport.safetyCheckpoint.paymentPerformed = demoCheckoutResult.payment.performed === true && demoCheckoutResult.payment.simulated !== true;
     executionReport.safetyCheckpoint.installationConfirmed = demoCheckoutResult.installation.confirmed;
     executionReport.safetyCheckpoint.finalOrderSubmitted = demoCheckoutResult.finalOrderSubmitted === true;
 
@@ -4701,14 +4632,11 @@ console.log(
           : '[SKIPPED] Payment fields not inspected.'
     );
 
-    if (demoCheckoutResult.placeOrderClicked === true) {
-  console.log(
-    '[COMPLETED] Demo Place Order click dispatched. No real order was created.'
-  );
-
-  finishExecutionStep('completed');
-  executionReport.status = 'completed';
-} else if (demoCheckoutResult.stoppedSafely) {
+    if (demoCheckoutResult.orderSummaryReached === true) {
+      console.log('[COMPLETED] Verified Order Summary reached. No real order was submitted.');
+      finishExecutionStep('completed');
+      executionReport.status = 'completed';
+    } else if (demoCheckoutResult.stoppedSafely) {
       console.log(
   '[INCOMPLETE] Order Summary has not been verified.'
 );
@@ -4721,12 +4649,15 @@ console.log(
     console.log('\nAUTOMATION CHECKPOINT:', executionReport.status);
 
 
-  } catch (error) {
+  } catch (caughtError) {
+  const error = automationTimedOut
+    ? Object.assign(new Error('Automation exceeded the configured maximum runtime.'), { code: 'AUTOMATION_TIMEOUT' })
+    : caughtError;
   finishExecutionStep('failed');
   executionReport.status = 'failed';
   if (error.creditCheckResult) {
     executionReport.creditCheck = error.creditCheckResult;
-    executionReport.safetyCheckpoint.creditCheckPerformed = true;
+    executionReport.safetyCheckpoint.creditCheckPerformed = error.creditCheckResult.simulated !== true;
   }
   executionReport.error = await captureFailureDiagnostics(page, error, {
     step: executionReport.steps.find(step => step.status === 'failed')?.name || null,
@@ -4743,6 +4674,7 @@ console.log(
     throw error;
 
       } finally {
+    if (automationTimer) clearTimeout(automationTimer);
     executionReport.finishedAt = new Date().toISOString();
     executionReport.durationMs = Date.now() - reportStartTime;
 
@@ -4783,6 +4715,7 @@ console.log(
         executionReport.status === 'completed',
 
       orderSummaryReached: executionReport.orderSummaryReached === true,
+      placeOrderClicked: executionReport.placeOrderClicked === true,
       orderConfirmationReached: executionReport.orderConfirmationReached === true,
       finalOrderSubmitted: executionReport.safetyCheckpoint.finalOrderSubmitted === true,
 
@@ -4838,7 +4771,6 @@ if (keepBrowserOpen) {
   if (context) {
     await context.close().catch(() => {});
   }
-
   if (browser) {
     await browser.close().catch(() => {});
   }

@@ -12,3 +12,5 @@ secure-data/
 /*.png
 /*.log
 /order-summary-search.txt
+# Persistent runtime job history
+.data/

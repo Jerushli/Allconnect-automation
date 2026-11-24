@@ -34,7 +34,7 @@ function mapOrderToAutomationInput(order) {
   (order.execution.stopBeforeFinalOrderSubmission !== true && !submitDemoOrder)
 ) {
   throw new Error(
-    'Only demo orders are accepted; final submission requires explicit demo opt-in.'
+    'Only demo orders are accepted; the simulator Order Summary transition requires explicit demo opt-in.'
   );
 }
 

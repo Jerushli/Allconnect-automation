@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const { test, expect } = require('@playwright/test');
 const { completeDemoCheckout } = require('../src/main');
@@ -118,7 +118,7 @@ function makeInput(sensitiveData = makeSensitivePayment()) {
   };
 }
 
-test('EZ-Enroll Yes selects card type, fills synthetic card, chooses billing address, acknowledges final Read, and submits demo order', async ({ page }) => {
+test('EZ-Enroll Yes selects card type, fills synthetic card, acknowledges authorization, and stops at Order Summary', async ({ page }) => {
   await installPortalFixture(page);
   await page.evaluate(() => {
     window.__confirmClickCount = 0;
@@ -129,7 +129,9 @@ test('EZ-Enroll Yes selects card type, fills synthetic card, chooses billing add
   expect(result.payment.cardDetailsEntered).toBe(true);
   expect(result.payment.forwardClicked).toBe(true);
   expect(result.orderSummaryReached).toBe(true);
-  expect(result.finalOrderSubmitted).toBe(true);
+  expect(result.finalOrderSubmitted).toBe(false);
+  expect(result.placeOrderClicked).toBe(false);
+  expect(result.payment.performed).toBe(false);
 
   const submitted = await page.evaluate(() => window.__submittedPayment);
   expect(submitted.cardType).toBe('visa');
@@ -144,10 +146,11 @@ test('EZ-Enroll Yes selects card type, fills synthetic card, chooses billing add
   expect(result.payment.finalReadChecked).toBe(true);
   expect(result.payment.submitOrderClicked).toBe(true);
   expect(result.orderSummaryVerification.summaryVisible).toBe(true);
+  expect(result.orderSummaryVerification.finalOrderSubmitted).toBe(false);
   expect(JSON.stringify(result)).not.toContain('4242424242424242');
 });
 
-test('expired EZ-Enroll card payload requests fresh details before filling the payment page', async ({ page }) => {
+test('expired EZ-Enroll card payload requests fresh details and stops at Order Summary', async ({ page }) => {
   await installPortalFixture(page);
   const expired = makeSensitivePayment();
   expired.expiresAt = Date.now() - 1;
@@ -166,7 +169,10 @@ test('expired EZ-Enroll card payload requests fresh details before filling the p
   expect(submitted.cardType).toBe('mastercard');
   expect(submitted.billing).toBe('no');
   expect(submitted.cardNumber).toBe('4242424242424242');
-  expect(result.finalOrderSubmitted).toBe(true);
+  expect(result.finalOrderSubmitted).toBe(false);
+  expect(result.placeOrderClicked).toBe(false);
+  expect(result.payment.performed).toBe(false);
+  expect(result.payment.submitOrderClicked).toBe(true);
 });
 
 

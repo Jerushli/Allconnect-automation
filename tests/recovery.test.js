@@ -366,3 +366,8 @@ test('failure diagnostics omit screenshots and raw exception text', async ({ pag
     'iframe-test-value'
   );
 });
+
+
+test('classifies the configured automation watchdog as a timeout', () => {
+  expect(classifyError(Object.assign(new Error('Automation exceeded the configured maximum runtime.'), { code: 'AUTOMATION_TIMEOUT' })).type).toBe('timeout');
+});

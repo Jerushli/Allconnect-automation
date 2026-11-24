@@ -40,6 +40,18 @@ async function postScenario(payload) {
   });
 }
 
+async function postJob(payload) {
+  const jwe = encryptJwe(payload, keys.publicKey, keys.kid);
+  return fetch(`${baseUrl}/api/jobs`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ order: sampleOrder, sensitiveJwe: jwe })
+  });
+}
+
 test.describe('JWE scenario API', () => {
   test.beforeAll(async () => {
     const app = createApp({
@@ -85,6 +97,31 @@ test.describe('JWE scenario API', () => {
     const body = await response.json();
     expect(response.status).toBe(200);
     expect(body.status).toBe('completed');
+    expect(capturedInput.sensitiveData.identity).toEqual({ ssn: '123456789', dob: '01/02/1990' });
+  });
+
+
+  test('accepts an encrypted asynchronous job and exposes sanitized persistent status', async () => {
+    const response = await postJob(identityPayload());
+    const accepted = await response.json();
+    expect(response.status).toBe(202);
+    expect(accepted.status).toBe('queued');
+    expect(accepted.jobId).toBeTruthy();
+
+    let job;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const statusResponse = await fetch(`${baseUrl}/api/jobs/${accepted.jobId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      expect(statusResponse.status).toBe(200);
+      job = (await statusResponse.json()).job;
+      if (job.status === 'completed' || job.status === 'failed') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    expect(job.status).toBe('completed');
+    expect(job.outcome).toBe('completed');
+    expect(JSON.stringify(job)).not.toContain('123456789');
     expect(capturedInput.sensitiveData.identity).toEqual({ ssn: '123456789', dob: '01/02/1990' });
   });
 
