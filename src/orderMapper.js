@@ -40,9 +40,9 @@ function mapOrderToAutomationInput(order) {
 
   if (submitDemoOrder && order.accountHolder.ezEnroll === true) {
   const options = order.paymentOptions;
-    if (!options || !['Visa', 'MasterCard', 'American Express', 'Discover'].includes(options.cardType) || typeof options.billingAddressSameAsService !== 'boolean') {
-      throw new Error('Demo paymentOptions must specify a supported cardType and billingAddressSameAsService boolean.');
-    }
+    if (!options || typeof options.billingAddressSameAsService !== 'boolean') {
+  throw new Error('Demo paymentOptions must specify billingAddressSameAsService.');
+}
   }
 
   // Do not accept identity or payment data through this API.
@@ -142,9 +142,8 @@ function mapOrderToAutomationInput(order) {
     },
 
     paymentOptions: order.paymentOptions ? {
-      cardType: order.paymentOptions.cardType,
-      billingAddressSameAsService: order.paymentOptions.billingAddressSameAsService
-    } : null,
+  billingAddressSameAsService: order.paymentOptions.billingAddressSameAsService
+} : null,
 
     execution: {
       mode: 'demo',

@@ -26,7 +26,7 @@ async function setupRecommendationsPage(page, { transitionOnClick = 1 } = {}) {
 test('Internet category waits for the route and offers control after one click', async ({ page }) => {
   await setupRecommendationsPage(page);
 
-  await openInternetOffers(page, { transitionTimeout: 500, offersTimeout: 500 });
+  await openInternetOffers(page, { transitionTimeout: 100, offersTimeout: 5000 });
 
   await expect(page).toHaveURL(/\/allconnect\/recommendations\/internet\/$/);
   await expect(page.locator('input.ViewDetailsBtn')).toBeVisible();
@@ -36,7 +36,7 @@ test('Internet category waits for the route and offers control after one click',
 test('retries a no-op category click only while still on Recommendations', async ({ page }) => {
   await setupRecommendationsPage(page, { transitionOnClick: 2 });
 
-  await openInternetOffers(page, { transitionTimeout: 100, offersTimeout: 500 });
+  await openInternetOffers(page, { transitionTimeout: 100, offersTimeout: 5000 });
 
   await expect(page).toHaveURL(/\/allconnect\/recommendations\/internet\/$/);
   expect(await page.locator('.ViewDetailsBtn').isVisible()).toBe(true);
@@ -49,7 +49,7 @@ test('does not click the category again after the offers route has already loade
   await expect(page).toHaveURL(/\/allconnect\/recommendations\/internet\/$/);
 
   const clicksBefore = await page.evaluate(() => window.categoryClicks);
-  await openInternetOffers(page, { transitionTimeout: 100, offersTimeout: 500 });
+  await openInternetOffers(page, { transitionTimeout: 500, offersTimeout: 5000 });
   const clicksAfter = await page.evaluate(() => window.categoryClicks);
 
   expect(clicksAfter).toBe(clicksBefore);

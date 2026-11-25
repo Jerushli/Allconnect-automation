@@ -116,7 +116,7 @@ Scenario JSON files live in `test-data/scenarios/`. They must not contain `ident
 
 ## Tests
 
-Execution reports use unique run IDs, atomic file writes, private file permissions, step timing, and distinct Order Summary / Place Order / final-submission flags. Full page HTML and control dumps are not printed. Rejected encrypted-input requests write sanitized failure reports; raw validation text, SSN, DOB, card details, and credentials are not written to reports. Browser launch, action, navigation, and total-run timeouts are configurable in `.env`. The browser context and process are closed after each run unless `KEEP_BROWSER_OPEN=true` is explicitly set for local interactive inspection. The API handles SIGINT/SIGTERM by stopping new requests, cancelling queued jobs, and waiting for the active browser workflow to clean up before shutdown.
+Execution reports use unique run IDs, atomic file writes, private file permissions, step timing, and distinct Order Summary / Place Order / final-submission flags. Full page HTML and control dumps are not printed. Rejected encrypted-input requests write sanitized failure reports; raw validation text, SSN, DOB, card details, and credentials are not written to reports. Browser launch, action, navigation, and total-run timeouts are configurable in `.env`. Headed demo runs keep Chrome open on the final page for inspection. Set `CLOSE_BROWSER_AFTER_RUN=true` to restore automatic browser cleanup. The API handles SIGINT/SIGTERM by stopping new requests, cancelling queued jobs, and waiting for the active browser workflow to clean up before shutdown.
 
 Run all automated tests:
 

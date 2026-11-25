@@ -54,7 +54,6 @@
     "type": "standard_shipping"
   },
   "paymentOptions": {
-    "cardType": "Visa",
     "billingAddressSameAsService": true
   }
 }

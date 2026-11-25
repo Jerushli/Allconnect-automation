@@ -120,7 +120,44 @@ function luhnValid(value) {
   }
   return sum % 10 === 0;
 }
+async function askTerminal(question) {
+  return new Promise(resolve => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
 
+    rl.question(question, answer => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+async function promptCardType(log = console.log) {
+  const cardTypes = {
+    '1': 'Visa',
+    '2': 'MasterCard',
+    '3': 'American Express',
+    '4': 'Discover'
+  };
+
+  while (true) {
+    log('\nSELECT CARD TYPE');
+    log('1. Visa');
+    log('2. MasterCard');
+    log('3. American Express');
+    log('4. Discover');
+
+    const choice = await askTerminal('Select card type (1-4): ');
+    if (cardTypes[choice]) {
+      log(`Selected card type: ${cardTypes[choice]}`);
+      return cardTypes[choice];
+    }
+
+    log('Invalid selection. Please enter 1, 2, 3 or 4.');
+  }
+}
 async function promptSensitivePayload(order, log = console.log) {
   const payload = {
     version: 1,
@@ -135,6 +172,7 @@ async function promptSensitivePayload(order, log = console.log) {
     payload.identity = { ssn, dob };
   } else {
     log('\nDEMO PAYMENT INPUT (masked; use simulator test-card values only)');
+    const cardType = await promptCardType(log);
     const cardHolderName = await readMasked('Enter test card holder name: ');
     const cardNumber = (await readMasked('Enter simulator test card number: ')).replace(/[ -]/g, '');
     if (!/^\d{13,19}$/.test(cardNumber) || !luhnValid(cardNumber) || !TEST_CARD_NUMBERS.has(cardNumber)) {
@@ -153,7 +191,7 @@ async function promptSensitivePayload(order, log = console.log) {
       throw inputError('Test card expiry must be in the future.', 'TEST_CARD_EXPIRED');
     }
     if (!/^\d{3,4}$/.test(cvv)) throw inputError('CVV must contain 3 or 4 digits.', 'CVV_FORMAT_INVALID');
-    payload.payment = { cardHolderName, cardNumber, expirationMonth, expirationYear, cvv };
+    payload.payment = { cardType, cardHolderName, cardNumber, expirationMonth, expirationYear, cvv };
   }
 
   // Start the seven-minute clock only after the final field has been entered.
@@ -182,6 +220,9 @@ function validateSensitivePayload(payload, order, now = Date.now()) {
   } else {
     if (payload.scenario !== 'ez-enroll-card' || !payload.payment) throw inputError('Encrypted payment payload is incomplete.', 'PAYMENT_PAYLOAD_INCOMPLETE');
     const card = payload.payment;
+    if (!['Visa', 'MasterCard', 'American Express', 'Discover'].includes(card.cardType)) {
+  throw inputError('A valid card type must be selected.', 'CARD_TYPE_INVALID');
+}
     const number = String(card.cardNumber || '');
     if (!TEST_CARD_NUMBERS.has(number) || !luhnValid(number)) throw inputError('Only supported synthetic test-card numbers are accepted.', 'TEST_CARD_UNSUPPORTED');
     const month = Number(card.expirationMonth);

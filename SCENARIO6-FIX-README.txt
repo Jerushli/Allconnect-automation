@@ -2,10 +2,10 @@ AllConnect automation update notes
 
 Protected workflow
 - The existing six scenario JSON files and customer / qualification / plan / checkout navigation remain unchanged.
-- The demo workflow ends at a verified Order Summary.
+- The demo workflow verifies Order Summary and clicks a separate Place Order control only when the scenario and local demo environment both opt in; otherwise it safely remains at Order Summary.
 - The simulator Submit Order UI transition requires both the scenario opt-in and ALLOW_DEMO_ORDER_SUBMISSION=true.
-- This transition does not submit a real order. Reports keep Order Summary, Place Order click, payment, installation confirmation, and final order submission separate.
-- The browser closes after a run by default. Set KEEP_BROWSER_OPEN=true only for local visible-browser inspection with HEADLESS=false.
+- A Place Order click is reported separately from verified final order submission and confirmation. The automation does not claim those later states without evidence.
+- Headed demo runs keep Chrome open on the final page by default. Set CLOSE_BROWSER_AFTER_RUN=true to close it automatically.
 
 Sensitive input
 - Scenario JSON must not contain identity or payment fields.

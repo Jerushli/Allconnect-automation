@@ -41,7 +41,8 @@
   },
   "execution": {
     "mode": "demo",
-    "stopBeforeFinalOrderSubmission": true
+    "stopBeforeFinalOrderSubmission": false,
+    "submitDemoOrder": true
   },
   "checkout": {
     "broadbandFactLabels": "not_requested",

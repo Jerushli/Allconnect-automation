@@ -373,9 +373,9 @@ function validateInput(input, options = {}) {
     // (ezEnroll=false) do not enter card details and proceed via authorization.
     if (input.accountHolder.ezEnroll === true) {
       const options = input.paymentOptions;
-      if (!options || !['Visa', 'MasterCard', 'American Express', 'Discover'].includes(options.cardType) || typeof options.billingAddressSameAsService !== 'boolean') {
-        throw new Error('EZ-Enroll paymentOptions must contain a supported cardType and billingAddressSameAsService boolean.');
-      }
+      if (!options || typeof options.billingAddressSameAsService !== 'boolean') {
+  throw new Error('EZ-Enroll paymentOptions must contain billingAddressSameAsService.');
+}
     }
   }
 
@@ -3279,24 +3279,88 @@ async function verifyOrderSummary(page) {
   };
 }
 
-async function verifyFinalOrderSummaryCheckpoint(page) {
-  // The simulator's verified Order Summary is the final supported checkpoint.
-  // A Place Order control is not guaranteed to exist on this destination, and
-  // this demo must never infer a real order submission from a UI transition.
+async function verifyFinalOrderSummaryCheckpoint(page, input) {
+  // Always verify the same Order Summary checkpoint first. Some simulator
+  // versions render a separate Place Order control on this page; others do
+  // not. Only click that control when this scenario and the local demo
+  // environment have both explicitly opted in to demo order submission.
   const verification = await verifyOrderSummary(page);
   if (!verification.reached) {
     throw new Error('Order Summary was not verified at the final demo checkpoint.');
   }
-  console.log('[VERIFIED] Order Summary reached. Stopping before any real order submission.');
-  return {
+
+  const result = {
     clicked: false,
     reached: true,
     orderSummaryReached: true,
     orderConfirmationReached: false,
     finalOrderSubmitted: false,
     confirmationReached: false,
-    verification: 'verified_order_summary_safe_stop'
+    verification: 'verified_order_summary_safe_stop',
+    reason: 'No separate Place Order control was available; stopped at verified Order Summary.'
   };
+
+  const explicitlyOptedIn =
+    input?.execution?.mode === 'demo' &&
+    input?.execution?.submitDemoOrder === true &&
+    process.env.ALLOW_DEMO_ORDER_SUBMISSION === 'true';
+
+  if (!explicitlyOptedIn) {
+    console.log('[VERIFIED] Order Summary reached. Final Place Order action remains disabled by the demo safety gate.');
+    return result;
+  }
+
+  const selector = 'button, input[type="button"], input[type="submit"], a, [role="button"]';
+  let matches = [];
+  const placeOrderDeadline = Date.now() + 5000;
+
+  // The simulator can render the summary before its final action control.
+  // Wait briefly for that control rather than closing the browser too early.
+  while (Date.now() < placeOrderDeadline && matches.length === 0) {
+    for (const frame of page.frames()) {
+      const controls = frame.locator(selector);
+      const indexes = await controls.evaluateAll(elements => elements
+        .map((element, index) => {
+          const label = String(
+            element.innerText || element.value || element.getAttribute('aria-label') || ''
+          ).replace(/\s+/g, ' ').trim();
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          const visible = style.display !== 'none' &&
+            style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+          return {
+            index,
+            matches: /^place order$/i.test(label),
+            visible,
+            enabled: !element.disabled
+          };
+        })
+        .filter(item => item.matches && item.visible && item.enabled)
+        .map(item => item.index));
+
+      for (const index of indexes) matches.push({ frame, index });
+    }
+    if (matches.length === 0) await pause(200);
+  }
+
+  if (matches.length === 0) {
+    console.log('[VERIFIED] Order Summary reached. No separate Place Order control was rendered; leaving the page at Order Summary.');
+    return result;
+  }
+
+  if (matches.length !== 1) {
+    throw new Error(`Expected one visible enabled Place Order control; found ${matches.length}.`);
+  }
+
+  const { frame, index } = matches[0];
+  await frame.locator(selector).nth(index).scrollIntoViewIfNeeded();
+  await frame.locator(selector).nth(index).click({ timeout: 15000, noWaitAfter: true });
+  console.log('[ACTION] Place Order clicked in the explicitly enabled demo scenario.');
+
+  result.clicked = true;
+  result.verification = 'place_order_click_dispatched';
+  result.reason = 'Place Order click dispatched; final submission/confirmation was not independently verified.';
+  return result;
 }
 
 async function fillPaymentField(checkoutFrame, selector, value, label) {
@@ -3733,20 +3797,20 @@ if (!summaryVerification.reached) {
 
 console.log('[VERIFIED] Order Summary content verified.');
 
-const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page);
+const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page, input);
 
     if (placeOrderResult.reached !== true) {
       throw new Error('Order Summary safe-stop checkpoint was not verified.');
     }
 
-    result.placeOrderClicked = false;
+    result.placeOrderClicked = placeOrderResult.clicked === true;
     result.placeOrderVerification = placeOrderResult;
     result.orderConfirmationReached = false;
 result.orderConfirmationVerification = {
   reached: false,
   reason: 'The demo portal does not expose a separate real-order confirmation state.'
 };
-    result.orderSummaryVerification = { ...summaryVerification, finalOrderSubmitted: false, placeOrderClicked: false };
+    result.orderSummaryVerification = { ...summaryVerification, finalOrderSubmitted: false, placeOrderClicked: placeOrderResult.clicked === true };
     result.orderSummaryReached = true;
     result.finalOrderSubmitted = false;
     result.installation.confirmed = false;
@@ -3758,10 +3822,12 @@ result.orderConfirmationVerification = {
       forwardClicked: true,
       finalReadChecked: true,
       submitOrderClicked: true,
-      status: 'order_summary_verified_safe_stop'
+      status: placeOrderResult.clicked ? 'place_order_click_dispatched_unverified' : 'order_summary_verified_safe_stop'
     };
     result.stoppedSafely = false;
-    result.stopReason = 'Professional-installation Order Summary verified; no real order was submitted.';
+    result.stopReason = placeOrderResult.clicked
+      ? 'Place Order click dispatched; final order confirmation was not independently verified.'
+      : 'Professional-installation Order Summary verified; no Place Order control was available.';
     return result;
   }
 
@@ -3865,30 +3931,59 @@ result.orderConfirmationVerification = {
 
   console.log('[ACTION] Edit Secure Fields clicked.');
 
-  // 4. Select the card network from scenario data, then fill only masked
-  // synthetic card details delivered through the JWE-protected runtime input.
-  const cardType = checkoutFrame.getByLabel(/^Card Type:?$/i);
-  await cardType.waitFor({ state: 'visible', timeout: 10000 });
-  const requestedCardType = input.paymentOptions?.cardType;
-  if (!['Visa', 'MasterCard', 'American Express', 'Discover'].includes(requestedCardType)) {
-    throw new Error('A supported card type must be supplied in paymentOptions.cardType.');
-  }
-  const cardTypeOptions = await cardType.locator('option').evaluateAll(options =>
-    options.map(option => ({ value: option.value, label: (option.label || option.textContent || '').trim() }))
-  );
-  const selectedCardType = cardTypeOptions.find(option =>
-    option.label.toLowerCase() === requestedCardType.toLowerCase() ||
-    option.value.toLowerCase() === requestedCardType.toLowerCase()
-  );
-  if (!selectedCardType) throw new Error(`Requested card type is not available: ${requestedCardType}.`);
-  await selectFieldWithDelay(cardType, { value: selectedCardType.value }, 'Demo Credit Check, Installation and Payment', 'Card Type');
-  if ((await cardType.locator('option:checked').textContent()).trim().toLowerCase() !== requestedCardType.toLowerCase()) {
-    throw createFieldActionError('Demo Credit Check, Installation and Payment', 'Card Type', 'The entered Card Type could not be verified.');
-  }
-  console.log(`[VERIFIED] Card type selected: ${requestedCardType}.`);
+// 4. Get the encrypted runtime payment input.
+// Card network selection now comes from the terminal, not scenario JSON.
+let sensitiveData = await getFreshSensitiveData(input);
+const payment = sensitiveData.payment;
 
-  let sensitiveData = await getFreshSensitiveData(input);
-  const payment = sensitiveData.payment;
+if (!payment) {
+  throw new Error('EZ-Enroll payment details are missing from the encrypted input.');
+}
+
+const requestedCardType = payment.cardType;
+
+if (!['Visa', 'MasterCard', 'American Express', 'Discover'].includes(requestedCardType)) {
+  throw new Error('A valid card type must be selected in the terminal.');
+}
+
+const cardType = checkoutFrame.getByLabel(/^Card Type:?$/i);
+await cardType.waitFor({ state: 'visible', timeout: 10000 });
+
+const cardTypeOptions = await cardType.locator('option').evaluateAll(options =>
+  options.map(option => ({
+    value: option.value,
+    label: (option.label || option.textContent || '').trim()
+  }))
+);
+
+const selectedCardType = cardTypeOptions.find(option =>
+  option.label.toLowerCase() === requestedCardType.toLowerCase() ||
+  option.value.toLowerCase() === requestedCardType.toLowerCase()
+);
+
+if (!selectedCardType) {
+  throw new Error(`Requested card type is not available: ${requestedCardType}.`);
+}
+
+await selectFieldWithDelay(
+  cardType,
+  { value: selectedCardType.value },
+  'Demo Credit Check, Installation and Payment',
+  'Card Type'
+);
+
+if (
+  (await cardType.locator('option:checked').textContent())
+    .trim().toLowerCase() !== requestedCardType.toLowerCase()
+) {
+  throw createFieldActionError(
+    'Demo Credit Check, Installation and Payment',
+    'Card Type',
+    'The entered Card Type could not be verified.'
+  );
+}
+
+console.log(`[VERIFIED] Card type selected: ${requestedCardType}.`);
   if (!payment) throw new Error('EZ-Enroll payment details are missing from the encrypted input.');
 
   const cardNumberField = checkoutFrame.getByLabel(/^Card Number:?$/i);
@@ -4027,13 +4122,13 @@ result.orderConfirmationVerification = {
   if (!summaryVerification.reached) {
     throw new Error('Order Summary route appeared, but its final content could not be verified.');
   }
-  const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page);
+  const placeOrderResult = await verifyFinalOrderSummaryCheckpoint(page, input);
 
   if (!placeOrderResult.reached) {
     throw new Error('Order Summary safe-stop checkpoint was not verified.');
   }
 
-  result.placeOrderClicked = false;
+  result.placeOrderClicked = placeOrderResult.clicked === true;
   result.placeOrderVerification = placeOrderResult;
   if (input.sensitiveData?.payment) {
     for (const key of Object.keys(input.sensitiveData.payment)) input.sensitiveData.payment[key] = '';
@@ -4043,16 +4138,19 @@ result.orderConfirmationVerification = {
   result.orderSummaryVerification = {
     ...summaryVerification,
     finalOrderSubmitted: false,
-    placeOrderClicked: false
+    placeOrderClicked: placeOrderResult.clicked === true
   };
   result.finalOrderSubmitted = false;
   result.payment = {
     performed: false, method: 'simulator_test_card', simulated: true, fieldsInspected: true,
     cardDetailsEntered: true, forwardClicked: true, finalReadChecked: true,
-    submitOrderClicked: true, status: 'order_summary_verified_safe_stop'
+    submitOrderClicked: true,
+    status: placeOrderResult.clicked ? 'place_order_click_dispatched_unverified' : 'order_summary_verified_safe_stop'
   };
   result.stoppedSafely = false;
-  result.stopReason = 'Simulator Submit Order transition reached a verified Order Summary; no real order was submitted.';
+  result.stopReason = placeOrderResult.clicked
+    ? 'Place Order click dispatched; final order confirmation was not independently verified.'
+    : 'Simulator Submit Order transition reached a verified Order Summary; no Place Order control was available.';
   return result;
 
 }
@@ -4176,10 +4274,11 @@ plan: {
       if (browser) browser.close().catch(() => {});
     }, cfg.maxRuntimeMs);
     if (typeof automationTimer.unref === 'function') automationTimer.unref();
-    // Browser retention is opt-in for local interactive inspection only.
+    // Keep headed demo sessions on their final page for inspection. Set
+    // CLOSE_BROWSER_AFTER_RUN=true only when automatic cleanup is preferred.
     if (
       input.execution?.mode === 'demo' &&
-      process.env.KEEP_BROWSER_OPEN === 'true' &&
+      process.env.CLOSE_BROWSER_AFTER_RUN !== 'true' &&
       cfg.headless === false
     ) {
       keepBrowserOpen = true;
@@ -4587,7 +4686,8 @@ console.log(
     // STEP 18: COMPLETE THE LOCALLY SIMULATED CREDIT / INSTALL / PAYMENT FLOW.
     startExecutionStep('Demo Credit Check, Installation and Payment');
     const demoCheckoutResult = await completeDemoCheckout(page, input);
-    keepBrowserOpen = process.env.KEEP_BROWSER_OPEN === 'true' && cfg.headless === false;
+    keepBrowserOpen = input.execution?.mode === 'demo' &&
+      process.env.CLOSE_BROWSER_AFTER_RUN !== 'true' && cfg.headless === false;
 
     executionReport.creditCheck = demoCheckoutResult.creditCheck;
     executionReport.installation = demoCheckoutResult.installation;

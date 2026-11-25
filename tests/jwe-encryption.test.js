@@ -56,6 +56,7 @@ test('EZ-Enroll payment payload accepts only supported synthetic test-card value
     expiresAt: now + SENSITIVE_TTL_MS,
     scenario: 'ez-enroll-card',
     payment: {
+      cardType: 'Visa',
       cardHolderName: 'Demo Test',
       cardNumber: '4242424242424242',
       expirationMonth: '12',

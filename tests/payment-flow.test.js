@@ -15,6 +15,7 @@ function makeSensitivePayment() {
     expiresAt: now + SENSITIVE_TTL_MS,
     scenario: 'ez-enroll-card',
     payment: {
+      cardType: 'Visa',
       cardHolderName: 'Demo Test',
       cardNumber: '4242424242424242',
       expirationMonth: '12',
@@ -24,7 +25,7 @@ function makeSensitivePayment() {
   };
 }
 
-async function installPortalFixture(page) {
+async function installPortalFixture(page, { includePlaceOrder = false } = {}) {
   const paymentMarkup = `
     <div class="box tinted">
       <p>To confirm the card has sufficient funds, please read and acknowledge.</p>
@@ -92,7 +93,9 @@ async function installPortalFixture(page) {
                 document.querySelector('#submitOrder').addEventListener('click', () => {
                   history.pushState({}, '', '/allconnect-frame/order-summary/');
                   document.title = 'Order Summary';
-                  document.body.innerHTML = '<h1>Order Summary</h1><div class="summary"><div class="item">Demo order completed</div><div>CHECKOUT_COMPLETED</div></div>';
+                  document.body.innerHTML = '<h1>Order Summary</h1><div class="summary"><div class="item">Demo order completed</div><div>CHECKOUT_COMPLETED</div>' + ${JSON.stringify(includePlaceOrder ? '<button id="placeOrder" type="button">Place Order</button>' : '')} + '</div>';
+                  const placeOrder = document.querySelector('#placeOrder');
+                  if (placeOrder) placeOrder.addEventListener('click', () => { window.parent.__placeOrderClickCount = (window.parent.__placeOrderClickCount || 0) + 1; });
                 });
               });
             });
@@ -150,32 +153,53 @@ test('EZ-Enroll Yes selects card type, fills synthetic card, acknowledges author
   expect(JSON.stringify(result)).not.toContain('4242424242424242');
 });
 
+
+test('explicitly opted-in demo clicks a separately rendered Place Order control', async ({ page }) => {
+  await installPortalFixture(page, { includePlaceOrder: true });
+  await page.evaluate(() => { window.__placeOrderClickCount = 0; });
+
+  const result = await completeDemoCheckout(page, makeInput());
+
+  expect(result.orderSummaryReached).toBe(true);
+  expect(result.placeOrderClicked).toBe(true);
+  expect(result.placeOrderVerification.clicked).toBe(true);
+  expect(result.finalOrderSubmitted).toBe(false);
+  expect(await page.evaluate(() => window.__placeOrderClickCount)).toBe(1);
+});
 test('expired EZ-Enroll card payload requests fresh details and stops at Order Summary', async ({ page }) => {
   await installPortalFixture(page);
+
   const expired = makeSensitivePayment();
   expired.expiresAt = Date.now() - 1;
+
   let refreshCount = 0;
   const input = makeInput(expired);
-  input.paymentOptions = { cardType: 'MasterCard', billingAddressSameAsService: false };
+
+  // Billing address is separate from the encrypted card payload.
+  input.paymentOptions.billingAddressSameAsService = false;
+
   input.requestSensitiveRefresh = async () => {
     refreshCount += 1;
-    return makeSensitivePayment();
+
+    const refreshed = makeSensitivePayment();
+    refreshed.payment.cardType = 'MasterCard';
+
+    return refreshed;
   };
 
   const result = await completeDemoCheckout(page, input);
+
   expect(refreshCount).toBe(1);
   expect(result.orderSummaryReached).toBe(true);
+
   const submitted = await page.evaluate(() => window.__submittedPayment);
+
   expect(submitted.cardType).toBe('mastercard');
   expect(submitted.billing).toBe('no');
   expect(submitted.cardNumber).toBe('4242424242424242');
+
   expect(result.finalOrderSubmitted).toBe(false);
   expect(result.placeOrderClicked).toBe(false);
   expect(result.payment.performed).toBe(false);
   expect(result.payment.submitOrderClicked).toBe(true);
 });
-
-
-
-
-
